@@ -102,6 +102,7 @@ These are reports and investigation notes, not a complete compatibility list. So
 ## To-do
 
 - [ ] Add support for other TOTK versions beyond the 1.0.0 base game.
+- [ ] Fix all current issues and bugs.
 
 ## Source and licenses
 
