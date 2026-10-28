@@ -1,0 +1,1011 @@
+diff -ruN a/wgpu-core/src/binding_model.rs b/wgpu-core/src/binding_model.rs
+--- a/wgpu-core/src/binding_model.rs	2026-05-01 22:18:31.000000000 -0400
++++ b/wgpu-core/src/binding_model.rs	2026-10-25 08:43:49.723475500 -0400
+@@ -1240,6 +1240,9 @@
+     /// Actual binding sizes for buffers that don't have `min_binding_size`
+     /// specified in BGL. Listed in the order of iteration of `BGL.entries`.
+     pub(crate) late_buffer_binding_infos: Vec<BindGroupLateBufferBindingInfo>,
++    /// (TOTK port) 1 + the texture discard epoch at which all its buffers and textures were found initialized
++    /// (0: not known); see `pass::flush_bindings_helper`
++    pub(crate) init_known: core::sync::atomic::AtomicU64,
+ }
+ 
+ impl Drop for BindGroup {
+diff -ruN a/wgpu-core/src/command/compute.rs b/wgpu-core/src/command/compute.rs
+--- a/wgpu-core/src/command/compute.rs	2026-05-01 22:18:31.000000000 -0400
++++ b/wgpu-core/src/command/compute.rs	2026-10-25 09:02:01.799467400 -0400
+@@ -553,6 +553,7 @@
+             pending_discard_init_fixups: SurfacesInDiscardState::new(),
+             scope: device.new_usage_scope(),
+             string_offset: 0,
++            merged_bind_groups: Default::default(),
+         },
+         active_query: None,
+ 
+diff -ruN a/wgpu-core/src/command/memory_init.rs b/wgpu-core/src/command/memory_init.rs
+--- a/wgpu-core/src/command/memory_init.rs	2026-05-01 22:18:31.000000000 -0400
++++ b/wgpu-core/src/command/memory_init.rs	2026-10-25 08:26:56.731562800 -0400
+@@ -17,6 +17,70 @@
+ 
+ use super::{clear_texture, BakedCommands, ClearError};
+ 
++/// (TOTK port) Bumped whenever a submit leaves texture surfaces discarded (uninitialized again): bind groups found
++/// initialized before must be checked again (`BindGroup::init_known`)
++pub(crate) static TOTK_DISCARD_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
++
++/// (TOTK port) WGPU_INIT_STATS=1 (measurement): what the submits' buffer initialization does, every 5 s on stderr:
++/// buffers checked, buffers with ranges to clear, the ranges and bytes cleared, and the buffer that cleared most.
++pub(crate) mod init_stats {
++    use alloc::{string::String, sync::Arc, vec::Vec};
++    use core::ops::Range;
++    use std::sync::{Mutex, OnceLock};
++    use std::time::Instant;
++
++    use crate::resource::{Buffer, Labeled};
++
++    pub fn on() -> bool {
++        static ON: OnceLock<bool> = OnceLock::new();
++        *ON.get_or_init(|| std::env::var_os("WGPU_INIT_STATS").is_some())
++    }
++    pub fn skip_empty() -> bool {
++        static C: OnceLock<(bool, bool)> = OnceLock::new();
++        crate::totk_switch("WGPU_INIT_SKIP_EMPTY", &C)
++    }
++    struct Totals {
++        since: Option<Instant>,
++        checked: u64,
++        cleared_buffers: u64,
++        ranges: u64,
++        bytes: u64,
++        top: (u64, String),
++    }
++    static T: Mutex<Totals> = Mutex::new(Totals {
++        since: None,
++        checked: 0,
++        cleared_buffers: 0,
++        ranges: 0,
++        bytes: 0,
++        top: (0, String::new()),
++    });
++    pub fn add(buffer: &Arc<Buffer>, ranges: &Vec<Range<wgt::BufferAddress>>) {
++        let mut t = T.lock().unwrap();
++        let now = Instant::now();
++        let since = *t.since.get_or_insert(now);
++        t.checked += 1;
++        if !ranges.is_empty() {
++            let bytes: u64 = ranges.iter().map(|r| r.end - r.start).sum();
++            t.cleared_buffers += 1;
++            t.ranges += ranges.len() as u64;
++            t.bytes += bytes;
++            if bytes > t.top.0 {
++                t.top = (bytes, alloc::format!("{} ({} ranges)", buffer.label(), ranges.len()));
++            }
++        }
++        let secs = (now - since).as_secs_f64();
++        if secs >= 5.0 {
++            std::eprintln!(
++                "[wgpu init stats] per s: {:.0} buffers checked, {:.0} with ranges to clear, {:.0} ranges, {:.2} MB; most: {} {:.2} MB",
++                t.checked as f64 / secs, t.cleared_buffers as f64 / secs, t.ranges as f64 / secs,
++                t.bytes as f64 / secs / 1e6, t.top.1, t.top.0 as f64 / 1e6
++            );
++            *t = Totals { since: Some(now), checked: 0, cleared_buffers: 0, ranges: 0, bytes: 0, top: (0, String::new()) };
++        }
++    }
++}
++
+ /// Surface that was discarded by `StoreOp::Discard` of a preceding renderpass.
+ /// Any read access to this surface needs to be preceded by a texture initialization.
+ #[derive(Clone)]
+@@ -40,6 +104,16 @@
+ }
+ 
+ impl CommandBufferTextureMemoryActions {
++    /// (TOTK port) how many init actions are recorded (flush_bindings_helper: did a bind group add any)
++    pub(crate) fn init_actions_len(&self) -> usize {
++        self.init_actions.len()
++    }
++
++    /// (TOTK port) no surface of this command buffer is discarded so far
++    pub(crate) fn no_discards(&self) -> bool {
++        self.discards.is_empty()
++    }
++
+     pub(crate) fn drain_init_actions(&mut self) -> Drain<'_, TextureInitTrackerAction> {
+         self.init_actions.drain(..)
+     }
+@@ -199,7 +273,16 @@
+             }
+         }
+ 
++        let stats = init_stats::on();
+         for (buffer, mut ranges) in uninitialized_ranges_per_buffer.into_values() {
++            if stats {
++                init_stats::add(&buffer, &ranges);
++            }
++            // (TOTK port) a buffer whose ranges were all initialized meanwhile (a queue write after the encoding)
++            // needs no clear, so no transition to COPY_DST and back either. WGPU_INIT_SKIP_EMPTY=0: as before
++            if ranges.is_empty() && init_stats::skip_empty() {
++                continue;
++            }
+             // Collapse touching ranges.
+             ranges.sort_by_key(|r| r.start);
+             for i in (1..ranges.len()).rev() {
+@@ -325,6 +408,9 @@
+         // Now that all buffers/textures have the proper init state for before
+         // cmdbuf start, we discard init states for textures it left discarded
+         // after its execution.
++        if !self.texture_memory_actions.discards.is_empty() {
++            TOTK_DISCARD_EPOCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
++        }
+         for surface_discard in self.texture_memory_actions.discards.iter() {
+             surface_discard
+                 .texture
+diff -ruN a/wgpu-core/src/command/pass.rs b/wgpu-core/src/command/pass.rs
+--- a/wgpu-core/src/command/pass.rs	2026-05-01 22:18:31.000000000 -0400
++++ b/wgpu-core/src/command/pass.rs	2026-10-25 09:02:01.797953100 -0400
+@@ -8,7 +8,7 @@
+ };
+ use crate::device::{Device, DeviceError, MissingFeatures};
+ use crate::pipeline::LateSizedBufferGroup;
+-use crate::resource::{DestroyedResourceError, Labeled, ParentDevice, QuerySet};
++use crate::resource::{DestroyedResourceError, Labeled, ParentDevice, QuerySet, Trackable};
+ use crate::track::{ResourceUsageCompatibilityError, UsageScope};
+ use crate::{api_log, binding_model};
+ use alloc::sync::Arc;
+@@ -57,6 +57,15 @@
+     pub(crate) dynamic_offset_count: usize,
+ 
+     pub(crate) string_offset: usize,
++
++    /// (TOTK port) WGPU_MERGE_ONCE (on; =0 off): the bind groups already merged into `scope` in this pass (a group set again,
++    /// often only for new dynamic offsets, adds no usage the first merge did not)
++    pub(crate) merged_bind_groups: crate::hash_utils::FastHashSet<crate::track::TrackerIndex>,
++}
++
++pub(crate) fn merge_once() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("WGPU_MERGE_ONCE").map_or(true, |v| v != "0"))
+ }
+ 
+ pub(crate) fn set_bind_group<E>(
+@@ -108,7 +117,9 @@
+ 
+         bind_group.validate_dynamic_bindings(index, &state.temp_offsets)?;
+ 
+-        if merge_bind_groups {
++        if merge_bind_groups
++            && (!merge_once() || state.merged_bind_groups.insert(bind_group.tracker_index()))
++        {
+             // Merge the bind group's resources into the tracker. We only do this
+             // for render passes. For compute passes it is done per dispatch in
+             // [`flush_bindings`].
+@@ -146,23 +157,46 @@
+     let entries = state.binder.list_valid_with_start(start);
+     let pipeline_layout = state.binder.pipeline_layout.as_ref().unwrap();
+ 
++    // (TOTK port) a bind group whose buffers and textures were all found initialized is not checked again (a lock
++    // and a range search per buffer and texture, every time it is bound) while no texture was left discarded since:
++    // buffers never become uninitialized again. WGPU_BG_INIT_KNOWN=0: checked each time, as before
++    static KNOWN: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
++    let known_on = crate::totk_switch("WGPU_BG_INIT_KNOWN", &KNOWN);
++    let epoch = super::memory_init::TOTK_DISCARD_EPOCH.load(core::sync::atomic::Ordering::Relaxed) + 1;
+     for (i, bind_group, dynamic_offsets) in entries {
+-        state.base.buffer_memory_init_actions.extend(
+-            bind_group.used_buffer_ranges.iter().filter_map(|action| {
+-                action
+-                    .buffer
+-                    .initialization_status
+-                    .read()
+-                    .check_action(action)
+-            }),
+-        );
+-        for action in bind_group.used_texture_ranges.iter() {
+-            state.pending_discard_init_fixups.extend(
+-                state
+-                    .base
+-                    .texture_memory_actions
+-                    .register_init_action(action),
++        let known = known_on
++            && bind_group.init_known.load(core::sync::atomic::Ordering::Relaxed) == epoch
++            && state.base.texture_memory_actions.no_discards();
++        if !known {
++            let (buffers_before, textures_before, fixups_before) = (
++                state.base.buffer_memory_init_actions.len(),
++                state.base.texture_memory_actions.init_actions_len(),
++                state.pending_discard_init_fixups.len(),
+             );
++            state.base.buffer_memory_init_actions.extend(
++                bind_group.used_buffer_ranges.iter().filter_map(|action| {
++                    action
++                        .buffer
++                        .initialization_status
++                        .read()
++                        .check_action(action)
++                }),
++            );
++            for action in bind_group.used_texture_ranges.iter() {
++                state.pending_discard_init_fixups.extend(
++                    state
++                        .base
++                        .texture_memory_actions
++                        .register_init_action(action),
++                );
++            }
++            if known_on
++                && state.base.buffer_memory_init_actions.len() == buffers_before
++                && state.base.texture_memory_actions.init_actions_len() == textures_before
++                && state.pending_discard_init_fixups.len() == fixups_before
++            {
++                bind_group.init_known.store(epoch, core::sync::atomic::Ordering::Relaxed);
++            }
+         }
+ 
+         let used_resource = bind_group
+diff -ruN a/wgpu-core/src/command/query.rs b/wgpu-core/src/command/query.rs
+--- a/wgpu-core/src/command/query.rs	2026-05-01 22:18:31.000000000 -0400
++++ b/wgpu-core/src/command/query.rs	2026-10-25 01:44:37.439407100 -0400
+@@ -45,6 +45,11 @@
+         mem::replace(&mut vec_pair.0[query as usize], true)
+     }
+ 
++    /// (TOTK port) No query of this pass needs a reset
++    pub fn is_empty(&self) -> bool {
++        self.map.is_empty()
++    }
++
+     pub fn reset_queries(&mut self, raw_encoder: &mut dyn hal::DynCommandEncoder) {
+         for (_, (state, query_set)) in self.map.drain() {
+             debug_assert_eq!(state.len(), query_set.desc.count as usize);
+diff -ruN a/wgpu-core/src/command/render.rs b/wgpu-core/src/command/render.rs
+--- a/wgpu-core/src/command/render.rs	2026-05-01 22:18:31.000000000 -0400
++++ b/wgpu-core/src/command/render.rs	2026-10-25 09:02:01.866636100 -0400
+@@ -1859,6 +1859,90 @@
+     }
+ }
+ 
++/// (TOTK port) WGPU_ONE_CB (on; =0 off) (see encode_render_pass)
++fn one_cb_on() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("WGPU_ONE_CB").map_or(true, |v| v != "0"))
++}
++
++/// (TOTK port) The usage scope a pass will have, from its commands and attachments, applied to the command buffer's
++/// tracker and its barriers recorded into the open command buffer. False (nothing changed) when the scope does not
++/// merge: the pass then goes the usual way, which reports the error.
++fn pre_pass_barriers(
++    parent_state: &mut EncodingState<InnerCommandEncoder>,
++    device: &Arc<Device>,
++    base: &BasePass<ArcRenderCommand, Infallible>,
++    color_attachments: &ColorAttachments<Arc<TextureView>>,
++    depth_stencil_attachment: Option<&ResolvedRenderPassDepthStencilAttachment<Arc<TextureView>>>,
++) -> bool {
++    let mut scope = device.new_usage_scope();
++    let built = (|| -> Result<(), ResourceUsageCompatibilityError> {
++        for at in color_attachments.iter().flatten() {
++            unsafe {
++                scope.textures.merge_single(
++                    &at.view.parent,
++                    Some(at.view.selector.clone()),
++                    wgt::TextureUses::COLOR_TARGET,
++                )?;
++            }
++            if let Some(ref resolve) = at.resolve_target {
++                unsafe {
++                    scope.textures.merge_single(
++                        &resolve.parent,
++                        Some(resolve.selector.clone()),
++                        wgt::TextureUses::COLOR_TARGET,
++                    )?;
++                }
++            }
++        }
++        if let Some(ds) = depth_stencil_attachment {
++            let usage = if ds.depth.is_readonly()
++                && ds.stencil.is_readonly()
++                && device
++                    .downlevel
++                    .flags
++                    .contains(wgt::DownlevelFlags::READ_ONLY_DEPTH_STENCIL)
++            {
++                wgt::TextureUses::DEPTH_STENCIL_READ | wgt::TextureUses::RESOURCE
++            } else {
++                wgt::TextureUses::DEPTH_STENCIL_WRITE
++            };
++            unsafe {
++                scope
++                    .textures
++                    .merge_single(&ds.view.parent, Some(ds.view.selector.clone()), usage)?;
++            }
++        }
++        for command in base.commands.iter() {
++            match command {
++                ArcRenderCommand::SetBindGroup {
++                    bind_group: Some(bind_group),
++                    ..
++                } => unsafe { scope.merge_bind_group(&bind_group.used)? },
++                ArcRenderCommand::SetIndexBuffer { buffer, .. } => {
++                    scope.buffers.merge_single(buffer, wgt::BufferUses::INDEX)?
++                }
++                ArcRenderCommand::SetVertexBuffer { buffer, .. } => {
++                    scope.buffers.merge_single(buffer, wgt::BufferUses::VERTEX)?
++                }
++                _ => {}
++            }
++        }
++        Ok(())
++    })();
++    if built.is_err() {
++        return false;
++    }
++    let indices = &device.tracker_indices;
++    parent_state.tracker.buffers.set_size(indices.buffers.size());
++    parent_state.tracker.textures.set_size(indices.textures.size());
++    let Ok(raw) = parent_state.raw_encoder.open_if_closed() else {
++        return false;
++    };
++    CommandEncoder::insert_barriers_from_scope(raw, parent_state.tracker, &scope, parent_state.snatch_guard);
++    true
++}
++
+ pub(super) fn encode_render_pass(
+     parent_state: &mut EncodingState<InnerCommandEncoder>,
+     mut base: BasePass<ArcRenderCommand, Infallible>,
+@@ -1876,17 +1960,52 @@
+ 
+     let mut indirect_draw_validation_batcher = crate::indirect_validation::DrawBatcher::new();
+ 
+-    // We automatically keep extending command buffers over time, and because
+-    // we want to insert a command buffer _before_ what we're about to record,
+-    // we need to make sure to close the previous one.
+-    parent_state
+-        .raw_encoder
+-        .close_if_open()
+-        .map_pass_err(pass_scope)?;
+-    let raw_encoder = parent_state
+-        .raw_encoder
+-        .open_pass(base.label.as_deref())
+-        .map_pass_err(pass_scope)?;
++    // (TOTK port) WGPU_ONE_CB (on; =0 off): the pass's barriers worked out before it is recorded, from its commands and
++    // attachments, and recorded into the open command buffer with the pass after them: no command buffer of its
++    // own and none for its barriers (two driver command buffers a pass, ~5 us each to begin).
++    // Passes with queries, timestamps, indirect draws or bundles go the usual way.
++    let one_cb = one_cb_on()
++        && timestamp_writes.is_none()
++        && occlusion_query_set.is_none()
++        && base.commands.iter().all(|c| {
++            !matches!(
++                c,
++                ArcRenderCommand::DrawIndirect { .. }
++                    | ArcRenderCommand::MultiDrawIndirectCount { .. }
++                    | ArcRenderCommand::DrawMeshTasks { .. }
++                    | ArcRenderCommand::WriteTimestamp { .. }
++                    | ArcRenderCommand::BeginOcclusionQuery { .. }
++                    | ArcRenderCommand::EndOcclusionQuery
++                    | ArcRenderCommand::BeginPipelineStatisticsQuery { .. }
++                    | ArcRenderCommand::EndPipelineStatisticsQuery
++                    | ArcRenderCommand::ExecuteBundle(_)
++            )
++        })
++        && pre_pass_barriers(
++            parent_state,
++            device,
++            &base,
++            &color_attachments,
++            depth_stencil_attachment.as_ref(),
++        );
++    let raw_encoder = if one_cb {
++        parent_state
++            .raw_encoder
++            .open_if_closed()
++            .map_pass_err(pass_scope)?
++    } else {
++        // We automatically keep extending command buffers over time, and because
++        // we want to insert a command buffer _before_ what we're about to record,
++        // we need to make sure to close the previous one.
++        parent_state
++            .raw_encoder
++            .close_if_open()
++            .map_pass_err(pass_scope)?;
++        parent_state
++            .raw_encoder
++            .open_pass(base.label.as_deref())
++            .map_pass_err(pass_scope)?
++    };
+ 
+     let (scope, pending_discard_init_fixups, mut pending_query_resets) = {
+         let mut pending_query_resets = QueryResetMap::new();
+@@ -1955,6 +2074,8 @@
+                 dynamic_offset_count: 0,
+ 
+                 string_offset: 0,
++
++                merged_bind_groups: Default::default(),
+             },
+ 
+             active_occlusion_query: None,
+@@ -2274,13 +2395,122 @@
+ 
+         let pending_discard_init_fixups = state.pass.pending_discard_init_fixups;
+ 
+-        parent_state.raw_encoder.close().map_pass_err(pass_scope)?;
++        if !one_cb {
++            parent_state.raw_encoder.close().map_pass_err(pass_scope)?;
++        }
+         (trackers, pending_discard_init_fixups, pending_query_resets)
+     };
+ 
+     let encoder = &mut parent_state.raw_encoder;
+     let tracker = &mut parent_state.tracker;
+ 
++    if one_cb {
++        // the barriers went in before the pass: what it really used must not need any more
++        tracker.buffers.set_from_usage_scope(&scope.buffers);
++        tracker.textures.set_from_usage_scope(&scope.textures);
++        // (a usage applied again that it already had gives a same-state transition, a write-after-write barrier
++        // the one before the pass already made: those are dropped)
++        let buffer_barriers = tracker
++            .buffers
++            .drain_transitions(parent_state.snatch_guard)
++            .filter(|b| b.usage.from != b.usage.to)
++            .collect::<Vec<_>>();
++        let (all_transitions, all_textures) = tracker.textures.drain_transitions(parent_state.snatch_guard);
++        let mut transitions = Vec::new();
++        let mut textures = Vec::new();
++        for (t, x) in all_transitions.into_iter().zip(all_textures.into_iter()) {
++            if t.usage.from != t.usage.to {
++                transitions.push(t);
++                textures.push(x);
++            }
++        }
++        let late = !buffer_barriers.is_empty()
++            || !transitions.is_empty()
++            || !pending_discard_init_fixups.is_empty()
++            || !pending_query_resets.is_empty()
++            || !indirect_draw_validation_batcher.is_empty();
++        if late {
++            static LOGGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
++            if LOGGED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 20 {
++                std::eprintln!(
++                    "[wgpu one-cb] a pass needed more after it than its pre-scan gave: {} buffer, {} texture barriers, {} discard fixups (applied late)",
++                    buffer_barriers.len(),
++                    transitions.len(),
++                    pending_discard_init_fixups.len()
++                );
++                for t in transitions.iter() {
++                    std::eprintln!(
++                        "[wgpu one-cb]   texture {:?} mips {:?} layers {:?}: {:?} -> {:?}",
++                        t.id,
++                        t.selector.mips,
++                        t.selector.layers,
++                        t.usage.from,
++                        t.usage.to
++                    );
++                }
++            }
++            let raw = encoder.open_if_closed().map_pass_err(pass_scope)?;
++            let texture_barriers = transitions
++                .into_iter()
++                .enumerate()
++                .map(|(i, p)| p.into_hal(textures[i].unwrap().raw()))
++                .collect::<Vec<_>>();
++            unsafe {
++                raw.transition_buffers(&buffer_barriers);
++                raw.transition_textures(&texture_barriers);
++            }
++            fixup_discarded_surfaces(
++                pending_discard_init_fixups.into_iter(),
++                raw,
++                &mut tracker.textures,
++                device,
++                parent_state.snatch_guard,
++            );
++        }
++        return Ok(());
++    }
++
++    // (TOTK port) WGPU_SKIP_EMPTY_TRANSIT (on; =0 off): no "Pre Pass" command buffer when the pass needs nothing before it
++    // (no barriers, discard fixups, query resets or indirect validation): each command buffer costs the driver a
++    // begin and an end, and wgpu made one per render pass besides the pass's own
++    let skip_empty = {
++        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        *ON.get_or_init(|| std::env::var("WGPU_SKIP_EMPTY_TRANSIT").map_or(true, |v| v != "0"))
++    };
++    if skip_empty
++        && pending_discard_init_fixups.is_empty()
++        && pending_query_resets.is_empty()
++        && indirect_draw_validation_batcher.is_empty()
++    {
++        tracker.buffers.set_from_usage_scope(&scope.buffers);
++        tracker.textures.set_from_usage_scope(&scope.textures);
++        let buffer_barriers = tracker
++            .buffers
++            .drain_transitions(parent_state.snatch_guard)
++            .collect::<Vec<_>>();
++        let (transitions, textures) = tracker.textures.drain_transitions(parent_state.snatch_guard);
++        if buffer_barriers.is_empty() && transitions.is_empty() {
++            return Ok(());
++        }
++        let texture_barriers = transitions
++            .into_iter()
++            .enumerate()
++            .map(|(i, p)| p.into_hal(textures[i].unwrap().raw()))
++            .collect::<Vec<_>>();
++        let transit = encoder
++            .open_pass(hal_label(
++                Some("(wgpu internal) Pre Pass"),
++                device.instance_flags,
++            ))
++            .map_pass_err(pass_scope)?;
++        unsafe {
++            transit.transition_buffers(&buffer_barriers);
++            transit.transition_textures(&texture_barriers);
++        }
++        encoder.close_and_swap().map_pass_err(pass_scope)?;
++        return Ok(());
++    }
++
+     {
+         let transit = encoder
+             .open_pass(hal_label(
+diff -ruN a/wgpu-core/src/device/resource.rs b/wgpu-core/src/device/resource.rs
+--- a/wgpu-core/src/device/resource.rs	2026-05-01 22:18:31.000000000 -0400
++++ b/wgpu-core/src/device/resource.rs	2026-10-25 08:50:44.251939200 -0400
+@@ -3460,6 +3460,7 @@
+             used_texture_ranges,
+             dynamic_binding_info,
+             late_buffer_binding_infos,
++            init_known: core::sync::atomic::AtomicU64::new(0),
+         };
+ 
+         let bind_group = Arc::new(bind_group);
+diff -ruN a/wgpu-core/src/indirect_validation/draw.rs b/wgpu-core/src/indirect_validation/draw.rs
+--- a/wgpu-core/src/indirect_validation/draw.rs	2026-05-01 22:18:31.000000000 -0400
++++ b/wgpu-core/src/indirect_validation/draw.rs	2026-10-25 01:44:56.469105800 -0400
+@@ -963,6 +963,11 @@
+ }
+ 
+ impl DrawBatcher {
++    /// (TOTK port) No indirect draw of the pass to validate
++    pub(crate) fn is_empty(&self) -> bool {
++        self.batches.is_empty()
++    }
++
+     pub(crate) fn new() -> Self {
+         Self {
+             batches: FastHashMap::default(),
+diff -ruN a/wgpu-core/src/lib.rs b/wgpu-core/src/lib.rs
+--- a/wgpu-core/src/lib.rs	2026-05-01 22:18:31.000000000 -0400
++++ b/wgpu-core/src/lib.rs	2026-10-25 08:16:52.605955800 -0400
+@@ -99,6 +99,18 @@
+ mod scratch;
+ pub mod validation;
+ 
++/// (TOTK port) A patch switch: on unless its environment variable is "0" (read once), flipped while HOS_AB's phase
++/// is 1 if HOS_AB_SWITCH names it (wgt::TOTK_AB_PHASE).
++pub(crate) fn totk_switch(name: &'static str, cell: &'static std::sync::OnceLock<(bool, bool)>) -> bool {
++    let (on, ab) = *cell.get_or_init(|| {
++        (
++            std::env::var(name).map_or(true, |v| v != "0"),
++            std::env::var("HOS_AB_SWITCH").map_or(false, |v| v == name),
++        )
++    });
++    on != (ab && wgt::TOTK_AB_PHASE.load(core::sync::atomic::Ordering::Relaxed) != 0)
++}
++
+ pub use validation::{map_storage_format_from_naga, map_storage_format_to_naga};
+ 
+ pub use hal::{api, MAX_BIND_GROUPS, MAX_COLOR_ATTACHMENTS, MAX_VERTEX_BUFFERS};
+diff -ruN a/wgpu-core/src/track/buffer.rs b/wgpu-core/src/track/buffer.rs
+--- a/wgpu-core/src/track/buffer.rs	2026-05-01 22:18:31.000000000 -0400
++++ b/wgpu-core/src/track/buffer.rs	2026-10-25 01:43:21.805853600 -0400
+@@ -100,6 +100,22 @@
+         self.metadata.clear();
+     }
+ 
++    /// (TOTK port) Only the members' entries reset (see ResourceMetadata::clear_sparse)
++    pub fn clear_sparse(&mut self) {
++        for index in self.metadata.owned_indices() {
++            self.state[index] = BufferUses::empty();
++        }
++        self.metadata.clear_sparse();
++    }
++
++    /// (TOTK port) Grow only
++    pub fn grow_to(&mut self, size: usize) {
++        if size > self.state.len() {
++            self.state.resize(size, BufferUses::empty());
++        }
++        self.metadata.grow_to(size);
++    }
++
+     /// Sets the size of all the vectors inside the tracker.
+     ///
+     /// Must be called with the highest possible Buffer ID before
+diff -ruN a/wgpu-core/src/track/metadata.rs b/wgpu-core/src/track/metadata.rs
+--- a/wgpu-core/src/track/metadata.rs	2026-05-01 22:18:31.000000000 -0400
++++ b/wgpu-core/src/track/metadata.rs	2026-10-25 01:43:07.598781700 -0400
+@@ -39,6 +39,28 @@
+         self.owned.fill(false);
+     }
+ 
++    /// (TOTK port) Only the members' entries reset, the vectors kept at their size: a usage scope is cleared after
++    /// every pass, and clearing and refilling vectors as long as the device's tracker indices (thousands of
++    /// textures) was a large part of a pass's cost. The caller resets its own per-index state for
++    /// `owned_indices()` before this.
++    pub(super) fn clear_sparse(&mut self) {
++        for index in iterate_bitvec_indices(&self.owned) {
++            // SAFETY: owned indices are in bounds (tracker_assert_in_bounds)
++            unsafe { *self.resources.get_unchecked_mut(index) = None };
++        }
++        self.owned.fill(false);
++    }
++
++    /// (TOTK port) Grow only: entries past the old size start out empty, entries below it are already reset.
++    pub(super) fn grow_to(&mut self, size: usize) {
++        if size > self.resources.len() {
++            self.resources.resize(size, None);
++        }
++        if size > self.owned.len() {
++            resize_bitvec(&mut self.owned, size);
++        }
++    }
++
+     /// Ensures a given index is in bounds for all arrays and does
+     /// sanity checks of the presence of a refcount.
+     ///
+diff -ruN a/wgpu-core/src/track/mod.rs b/wgpu-core/src/track/mod.rs
+--- a/wgpu-core/src/track/mod.rs	2026-05-01 22:18:31.000000000 -0400
++++ b/wgpu-core/src/track/mod.rs	2026-10-25 01:43:07.599785500 -0400
+@@ -522,11 +522,22 @@
+     pub textures: TextureUsageScope,
+ }
+ 
++/// (TOTK port) WGPU_SPARSE_SCOPES=0: usage scopes cleared and resized whole after every pass, as upstream.
++pub(crate) fn sparse_scopes() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("WGPU_SPARSE_SCOPES").map_or(true, |v| v != "0"))
++}
++
+ impl<'a> Drop for UsageScope<'a> {
+     fn drop(&mut self) {
+         // clear vecs and push into pool
+-        self.buffers.clear();
+-        self.textures.clear();
++        if sparse_scopes() {
++            self.buffers.clear_sparse();
++            self.textures.clear_sparse();
++        } else {
++            self.buffers.clear();
++            self.textures.clear();
++        }
+         self.pool
+             .lock()
+             .push((mem::take(&mut self.buffers), mem::take(&mut self.textures)));
+@@ -548,9 +559,14 @@
+             textures: pooled.1,
+         };
+ 
+-        scope.buffers.set_size(tracker_indices.buffers.size());
++        if sparse_scopes() {
++            scope.buffers.grow_to(tracker_indices.buffers.size());
++            scope.textures.grow_to(tracker_indices.textures.size());
++        } else {
++            scope.buffers.set_size(tracker_indices.buffers.size());
++            scope.textures.set_size(tracker_indices.textures.size());
++        }
+         scope.buffers.set_ordered_uses_mask(ordered_buffer_usages);
+-        scope.textures.set_size(tracker_indices.textures.size());
+         scope.textures.set_ordered_uses_mask(ordered_texture_usages);
+         scope
+     }
+diff -ruN a/wgpu-core/src/track/texture.rs b/wgpu-core/src/track/texture.rs
+--- a/wgpu-core/src/track/texture.rs	2026-05-01 22:18:31.000000000 -0400
++++ b/wgpu-core/src/track/texture.rs	2026-10-25 01:43:21.806857100 -0400
+@@ -283,6 +283,23 @@
+         self.metadata.clear();
+     }
+ 
++    /// (TOTK port) Only the members' entries reset (see ResourceMetadata::clear_sparse)
++    pub fn clear_sparse(&mut self) {
++        for index in self.metadata.owned_indices() {
++            self.set.simple[index] = TextureUses::UNINITIALIZED;
++        }
++        self.set.complex.clear();
++        self.metadata.clear_sparse();
++    }
++
++    /// (TOTK port) Grow only
++    pub fn grow_to(&mut self, size: usize) {
++        if size > self.set.simple.len() {
++            self.set.simple.resize(size, TextureUses::UNINITIALIZED);
++        }
++        self.metadata.grow_to(size);
++    }
++
+     /// Sets the size of all the vectors inside the tracker.
+     ///
+     /// Must be called with the highest possible Texture ID before
+diff -ruN a/wgpu-hal/src/vulkan/adapter.rs b/wgpu-hal/src/vulkan/adapter.rs
+--- a/wgpu-hal/src/vulkan/adapter.rs	2026-05-01 22:18:31.000000000 -0400
++++ b/wgpu-hal/src/vulkan/adapter.rs	2026-10-25 01:46:04.827490700 -0400
+@@ -2745,6 +2745,7 @@
+             features,
+             workarounds: self.workarounds,
+             render_passes: Mutex::new(Default::default()),
++            shared_framebuffers: Mutex::new(Default::default()),
+             sampler_cache: Mutex::new(super::sampler::SamplerCache::new(
+                 self.private_caps.maximum_samplers,
+             )),
+diff -ruN a/wgpu-hal/src/vulkan/command.rs b/wgpu-hal/src/vulkan/command.rs
+--- a/wgpu-hal/src/vulkan/command.rs	2026-05-01 22:18:31.000000000 -0400
++++ b/wgpu-hal/src/vulkan/command.rs	2026-10-25 03:23:47.736900100 -0400
+@@ -38,6 +38,57 @@
+     }
+ }
+ 
++
++/// WGPU_HAL_STATS=1 (TOTK port, measurement): time spent in driver calls that happen once per command buffer or
++/// render pass, printed to stderr every 5 s (per second).
++pub(super) mod hal_stats {
++    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++    use std::sync::OnceLock;
++    use std::time::Instant;
++    use std::string::String;
++    pub const CREATE_FB: usize = 0;
++    pub const DESTROY_FB: usize = 1;
++    pub const ALLOC_CB: usize = 2;
++    pub const BEGIN_CB: usize = 3;
++    pub const END_CB: usize = 4;
++    pub const RESET_POOL: usize = 5;
++    pub const BEGIN_RP: usize = 6;
++    pub const END_RP: usize = 7;
++    const NAMES: [&str; 8] = [
++        "create_framebuffer", "destroy_framebuffer", "allocate_command_buffers", "begin_command_buffer",
++        "end_command_buffer", "reset_command_pool", "cmd_begin_render_pass", "cmd_end_render_pass",
++    ];
++    static NS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
++    static N: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
++    static LAST: AtomicU64 = AtomicU64::new(0);
++    fn epoch() -> &'static Instant {
++        static E: OnceLock<Instant> = OnceLock::new();
++        E.get_or_init(Instant::now)
++    }
++    pub fn on() -> bool {
++        static ON: OnceLock<bool> = OnceLock::new();
++        *ON.get_or_init(|| std::env::var_os("WGPU_HAL_STATS").is_some())
++    }
++    pub fn add(i: usize, t0: Instant) {
++        NS[i].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
++        N[i].fetch_add(1, Relaxed);
++        let now = epoch().elapsed().as_secs();
++        let last = LAST.load(Relaxed);
++        if now >= last + 5 && LAST.compare_exchange(last, now, Relaxed, Relaxed).is_ok() {
++            let secs = (now - last).max(1) as f64;
++            let mut line = String::new();
++            for k in 0..8 {
++                let ns = NS[k].swap(0, Relaxed);
++                let n = N[k].swap(0, Relaxed);
++                if n > 0 {
++                    line += &format!(" {} {:.0}/s {:.2} ms/s;", NAMES[k], n as f64 / secs, ns as f64 / 1e6 / secs);
++                }
++            }
++            eprintln!("[wgpu-hal stats]{line}");
++        }
++    }
++}
++
+ impl super::CommandEncoder {
+     fn write_pass_end_timestamp_if_requested(&mut self) {
+         if let Some((query_set, index)) = self.end_of_pass_timer_query.take() {
+@@ -52,6 +103,29 @@
+         }
+     }
+ 
++    /// (TOTK port) A framebuffer from the device-wide cache (WGPU_SHARED_FRAMEBUFFERS (on; =0 off)), for passes whose views
++    /// are all real views (not this encoder's temporary 3D-slice views, destroyed with the encoder)
++    fn make_shared_framebuffer(&mut self, key: super::FramebufferKey) -> vk::Framebuffer {
++        let mut shared = self.device.shared_framebuffers.lock();
++        if let Some(fb) = shared.map.get(&key) {
++            return *fb;
++        }
++        let vk_info = vk::FramebufferCreateInfo::default()
++            .render_pass(key.raw_pass)
++            .width(key.extent.width)
++            .height(key.extent.height)
++            .layers(key.extent.depth_or_array_layers)
++            .attachments(&key.attachment_views);
++        let __t = hal_stats::on().then(std::time::Instant::now);
++        let raw = unsafe { self.device.raw.create_framebuffer(&vk_info, None).unwrap() };
++        if let Some(t) = __t { hal_stats::add(hal_stats::CREATE_FB, t); }
++        for identity in key.attachment_identities.iter() {
++            shared.by_view.entry(identity.id).or_default().push(key.clone());
++        }
++        shared.map.insert(key, raw);
++        raw
++    }
++
+     fn make_framebuffer(
+         &mut self,
+         key: super::FramebufferKey,
+@@ -73,7 +147,9 @@
+                     .layers(extent.depth_or_array_layers)
+                     .attachments(attachment_views);
+ 
++                let __t = hal_stats::on().then(std::time::Instant::now);
+                 let raw = unsafe { self.device.raw.create_framebuffer(&vk_info, None).unwrap() };
++                if let Some(t) = __t { hal_stats::add(hal_stats::CREATE_FB, t); }
+                 *e.insert(raw)
+             }
+         })
+@@ -124,12 +200,14 @@
+             let vk_info = vk::CommandBufferAllocateInfo::default()
+                 .command_pool(self.raw)
+                 .command_buffer_count(ALLOCATION_GRANULARITY);
++            let __t = hal_stats::on().then(std::time::Instant::now);
+             let cmd_buf_vec = unsafe {
+                 self.device
+                     .raw
+                     .allocate_command_buffers(&vk_info)
+                     .map_err(super::map_host_device_oom_err)?
+             };
++            if let Some(t) = __t { hal_stats::add(hal_stats::ALLOC_CB, t); }
+             self.free.extend(cmd_buf_vec);
+         }
+         let raw = self.free.pop().unwrap();
+@@ -143,8 +221,10 @@
+ 
+         let vk_info = vk::CommandBufferBeginInfo::default()
+             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
++        let __t = hal_stats::on().then(std::time::Instant::now);
+         unsafe { self.device.raw.begin_command_buffer(raw, &vk_info) }
+             .map_err(super::map_host_device_oom_err)?;
++        if let Some(t) = __t { hal_stats::add(hal_stats::BEGIN_CB, t); }
+         self.active = raw;
+ 
+         Ok(())
+@@ -153,7 +233,9 @@
+     unsafe fn end_encoding(&mut self) -> Result<super::CommandBuffer, crate::DeviceError> {
+         let raw = self.active;
+         self.active = vk::CommandBuffer::null();
++        let __t = hal_stats::on().then(std::time::Instant::now);
+         unsafe { self.device.raw.end_command_buffer(raw) }.map_err(map_err)?;
++        if let Some(t) = __t { hal_stats::add(hal_stats::END_CB, t); }
+         fn map_err(err: vk::Result) -> crate::DeviceError {
+             // We don't use VK_KHR_video_encode_queue
+             // VK_ERROR_INVALID_VIDEO_STD_PARAMETERS_KHR
+@@ -181,14 +263,18 @@
+             .extend(cmd_bufs.into_iter().map(|cmd_buf| cmd_buf.raw));
+         self.free.append(&mut self.discarded);
+         // Delete framebuffers from the framebuffer cache
++        let __t = hal_stats::on().then(std::time::Instant::now);
+         for (_, framebuffer) in self.framebuffers.drain() {
+             unsafe { self.device.raw.destroy_framebuffer(framebuffer, None) };
+         }
++        if let Some(t) = __t { hal_stats::add(hal_stats::DESTROY_FB, t); }
++        let __t = hal_stats::on().then(std::time::Instant::now);
+         let _ = unsafe {
+             self.device
+                 .raw
+                 .reset_command_pool(self.raw, vk::CommandPoolResetFlags::default())
+         };
++        if let Some(t) = __t { hal_stats::add(hal_stats::RESET_POOL, t); }
+     }
+ 
+     unsafe fn transition_buffers<'a, T>(&mut self, barriers: T)
+@@ -797,8 +883,10 @@
+             extent: desc.extent,
+         };
+ 
++        let mut temp_views = false;
+         for cat in desc.color_attachments {
+             if let Some(cat) = cat.as_ref() {
++                temp_views |= cat.target.view.dimension == wgt::TextureViewDimension::D3;
+                 let color_view = if cat.target.view.dimension == wgt::TextureViewDimension::D3 {
+                     let key = super::TempTextureViewKey {
+                         texture: cat.target.view.raw_texture,
+@@ -866,7 +954,11 @@
+ 
+         let raw_pass = self.device.make_render_pass(rp_key).unwrap();
+         fb_key.raw_pass = raw_pass;
+-        let raw_framebuffer = self.make_framebuffer(fb_key).unwrap();
++        let raw_framebuffer = if super::shared_framebuffers_on() && !temp_views {
++            self.make_shared_framebuffer(fb_key)
++        } else {
++            self.make_framebuffer(fb_key).unwrap()
++        };
+ 
+         let vk_info = vk::RenderPassBeginInfo::default()
+             .render_pass(raw_pass)
+@@ -898,11 +990,13 @@
+             self.device
+                 .raw
+                 .cmd_set_scissor(self.active, 0, &[render_area]);
++            let __t = hal_stats::on().then(std::time::Instant::now);
+             self.device.raw.cmd_begin_render_pass(
+                 self.active,
+                 &vk_info,
+                 vk::SubpassContents::INLINE,
+             );
++            if let Some(t) = __t { hal_stats::add(hal_stats::BEGIN_RP, t); }
+         };
+ 
+         self.bind_point = vk::PipelineBindPoint::GRAPHICS;
+@@ -910,9 +1004,11 @@
+         Ok(())
+     }
+     unsafe fn end_render_pass(&mut self) {
++        let __t = hal_stats::on().then(std::time::Instant::now);
+         unsafe {
+             self.device.raw.cmd_end_render_pass(self.active);
+         }
++        if let Some(t) = __t { hal_stats::add(hal_stats::END_RP, t); }
+ 
+         // After all other commands but before debug marker, so this is still seen as part of this pass.
+         self.write_pass_end_timestamp_if_requested();
+diff -ruN a/wgpu-hal/src/vulkan/device.rs b/wgpu-hal/src/vulkan/device.rs
+--- a/wgpu-hal/src/vulkan/device.rs	2026-05-01 22:18:31.000000000 -0400
++++ b/wgpu-hal/src/vulkan/device.rs	2026-10-25 01:46:04.850312100 -0400
+@@ -1176,6 +1176,17 @@
+         })
+     }
+     unsafe fn destroy_texture_view(&self, view: super::TextureView) {
++        if super::shared_framebuffers_on() {
++            // (wgpu-core destroys a view after the GPU is done with it: so are the framebuffers that use it)
++            let mut shared = self.shared.shared_framebuffers.lock();
++            if let Some(keys) = shared.by_view.remove(&view.view_identity.id) {
++                for key in keys {
++                    if let Some(fb) = shared.map.remove(&key) {
++                        unsafe { self.shared.raw.destroy_framebuffer(fb, None) };
++                    }
++                }
++            }
++        }
+         unsafe { self.shared.raw.destroy_image_view(view.raw, None) };
+ 
+         self.counters.texture_views.sub(1);
+diff -ruN a/wgpu-hal/src/vulkan/mod.rs b/wgpu-hal/src/vulkan/mod.rs
+--- a/wgpu-hal/src/vulkan/mod.rs	2026-05-01 22:18:31.000000000 -0400
++++ b/wgpu-hal/src/vulkan/mod.rs	2026-10-25 03:23:47.750801500 -0400
+@@ -484,6 +484,9 @@
+     workarounds: Workarounds,
+     features: wgt::Features,
+     render_passes: Mutex<FastHashMap<RenderPassKey, vk::RenderPass>>,
++    /// (TOTK port) WGPU_SHARED_FRAMEBUFFERS (on; =0 off): framebuffers kept device-wide while their views live, instead of
++    /// per command encoder and destroyed each time it is reset (a framebuffer made and destroyed per render pass)
++    shared_framebuffers: Mutex<SharedFramebuffers>,
+     sampler_cache: Mutex<sampler::SamplerCache>,
+     memory_allocations_counter: InternalCounter,
+ 
+@@ -910,6 +913,18 @@
+     _phantom: PhantomData<T>,
+ }
+ 
++/// (TOTK port) The device-wide framebuffers and, by view identity, the keys of the ones using each view
++#[derive(Default)]
++struct SharedFramebuffers {
++    map: FastHashMap<FramebufferKey, vk::Framebuffer>,
++    by_view: FastHashMap<u64, Vec<FramebufferKey>>,
++}
++
++pub(super) fn shared_framebuffers_on() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("WGPU_SHARED_FRAMEBUFFERS").map_or(true, |v| v != "0"))
++}
++
+ #[derive(Clone, Eq, Hash, PartialEq)]
+ struct FramebufferKey {
+     raw_pass: vk::RenderPass,
+diff -ruN a/wgpu-types/src/lib.rs b/wgpu-types/src/lib.rs
+--- a/wgpu-types/src/lib.rs	2026-05-01 22:18:31.000000000 -0400
++++ b/wgpu-types/src/lib.rs	2026-10-25 08:16:52.605452100 -0400
+@@ -51,6 +51,10 @@
+ mod vertex;
+ mod write_only;
+ 
++/// (TOTK port) HOS_AB's phase, set each frame by the renderer through wgpu-native's wgpuTotkSetAbPhase: while it is
++/// 1, the TOTK patch switch that HOS_AB_SWITCH names is flipped (an A/B inside one run, for a machine other jobs load)
++pub static TOTK_AB_PHASE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
++
+ pub use adapter::*;
+ pub use backend::*;
+ pub use binding::*;

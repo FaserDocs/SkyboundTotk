@@ -1,0 +1,33 @@
+# User-provided game data and generated game-derived outputs must never be published.
+/game/
+/build/
+/dist/
+*.nsp
+*.xci
+*.nca
+*.nsz
+*.xcz
+*.keys
+*.sav
+
+# Generated build tools and compiler output.
+__pycache__/
+*.pyc
+*.o
+*.obj
+*.ilk
+*.pdb
+*.exe
+*.dll
+*.lib
+*.exp
+*.log
+*.out
+*.sha1
+/a64-kit/tools/lld-link.exe
+/a64-kit/lift/liba64emit.so
+
+# Required, distributable wgpu-native runtime and import library.
+!third_party/wgpu-native/lib/wgpu_native.dll
+!third_party/wgpu-native/lib/wgpu_native.dll.lib
+!third_party/sdl2/SDL2.dll

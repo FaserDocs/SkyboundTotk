@@ -1,0 +1,60 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index dde9a8c..d656efa 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -77,6 +77,9 @@ glsl = ["naga/glsl-in", "wgc/glsl"]
+ ## Enable accepting WGSL shaders as input.
+ wgsl = ["wgc/wgsl"]
+ 
++## (TOTK port, experiment) mimalloc as the Rust allocator.
++totk-mimalloc = ["dep:mimalloc"]
++
+ #! ### Logging & Tracing
+ # --------------------------------------------------------------------
+ #! The following features do not have any effect on the WebGPU backend.
+@@ -130,6 +133,14 @@ thiserror = "2"
+ parking_lot = "0.12"
+ smallvec = "1"
+ bitflags = "2"
++mimalloc = { version = "0.1", default-features = false, optional = true }
+ 
+ [build-dependencies]
+ bindgen = "0.72"
++
++# (TOTK port) the patched wgpu in ../wgpu-patched (29.0.3 + per-pass cost patches, all env-switchable)
++[patch.crates-io]
++wgpu-core = { path = "../wgpu-patched/wgpu-core" }
++wgpu-hal = { path = "../wgpu-patched/wgpu-hal" }
++wgpu-types = { path = "../wgpu-patched/wgpu-types" }
++naga = { path = "../wgpu-patched/naga" }
+diff --git a/src/lib.rs b/src/lib.rs
+index ba92673..cd88a13 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,5 +1,12 @@
+ #![allow(clippy::missing_safety_doc)]
+ 
++// (TOTK port, feature totk-mimalloc: an experiment, not measured yet) mimalloc as the Rust allocator: wgpu-core
++// allocates per pass, bind group and command (vectors, scopes, trackers), and Windows' heap was ~8% of the encoding
++// threads' busy time
++#[cfg(feature = "totk-mimalloc")]
++#[global_allocator]
++static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
++
+ use conv::{
+     from_u64_bits, map_adapter_type, map_backend_type, map_bind_group_entry,
+     map_bind_group_layout_entry, map_device_descriptor, map_instance_backend_flags,
+@@ -4480,6 +4487,13 @@ pub unsafe extern "C" fn wgpuQueueSubmitForIndex(
+     }
+ }
+ 
++/// (TOTK port) HOS_AB's phase, set by the renderer each frame: while it is 1, the wgpu patch switch HOS_AB_SWITCH
++/// names is flipped (an A/B inside one run)
++#[no_mangle]
++pub extern "C" fn wgpuTotkSetAbPhase(phase: u32) {
++    wgt::TOTK_AB_PHASE.store(phase, std::sync::atomic::Ordering::Relaxed);
++}
++
+ // FIXME: rework this function to match how wgpu v27 handles polling devices
+ #[no_mangle]
+ pub unsafe extern "C" fn wgpuDevicePoll(

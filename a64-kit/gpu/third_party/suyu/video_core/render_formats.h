@@ -1,0 +1,98 @@
+// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Rexcomp: the render target / depth format enums from suyu's video_core/gpu.h.
+#pragma once
+#include "common/common_types.h"
+
+namespace Tegra {
+enum class RenderTargetFormat : u32 {
+    NONE = 0x0,
+    R32G32B32A32_FLOAT = 0xC0,
+    R32G32B32A32_SINT = 0xC1,
+    R32G32B32A32_UINT = 0xC2,
+    R32G32B32X32_FLOAT = 0xC3,
+    R32G32B32X32_SINT = 0xC4,
+    R32G32B32X32_UINT = 0xC5,
+    R16G16B16A16_UNORM = 0xC6,
+    R16G16B16A16_SNORM = 0xC7,
+    R16G16B16A16_SINT = 0xC8,
+    R16G16B16A16_UINT = 0xC9,
+    R16G16B16A16_FLOAT = 0xCA,
+    R32G32_FLOAT = 0xCB,
+    R32G32_SINT = 0xCC,
+    R32G32_UINT = 0xCD,
+    R16G16B16X16_FLOAT = 0xCE,
+    A8R8G8B8_UNORM = 0xCF,
+    A8R8G8B8_SRGB = 0xD0,
+    A2B10G10R10_UNORM = 0xD1,
+    A2B10G10R10_UINT = 0xD2,
+    A8B8G8R8_UNORM = 0xD5,
+    A8B8G8R8_SRGB = 0xD6,
+    A8B8G8R8_SNORM = 0xD7,
+    A8B8G8R8_SINT = 0xD8,
+    A8B8G8R8_UINT = 0xD9,
+    R16G16_UNORM = 0xDA,
+    R16G16_SNORM = 0xDB,
+    R16G16_SINT = 0xDC,
+    R16G16_UINT = 0xDD,
+    R16G16_FLOAT = 0xDE,
+    A2R10G10B10_UNORM = 0xDF,
+    B10G11R11_FLOAT = 0xE0,
+    R32_SINT = 0xE3,
+    R32_UINT = 0xE4,
+    R32_FLOAT = 0xE5,
+    X8R8G8B8_UNORM = 0xE6,
+    X8R8G8B8_SRGB = 0xE7,
+    R5G6B5_UNORM = 0xE8,
+    A1R5G5B5_UNORM = 0xE9,
+    R8G8_UNORM = 0xEA,
+    R8G8_SNORM = 0xEB,
+    R8G8_SINT = 0xEC,
+    R8G8_UINT = 0xED,
+    R16_UNORM = 0xEE,
+    R16_SNORM = 0xEF,
+    R16_SINT = 0xF0,
+    R16_UINT = 0xF1,
+    R16_FLOAT = 0xF2,
+    R8_UNORM = 0xF3,
+    R8_SNORM = 0xF4,
+    R8_SINT = 0xF5,
+    R8_UINT = 0xF6,
+
+    // A8_UNORM = 0xF7,
+    X1R5G5B5_UNORM = 0xF8,
+    X8B8G8R8_UNORM = 0xF9,
+    X8B8G8R8_SRGB = 0xFA,
+    /*
+    Z1R5G5B5_UNORM = 0xFB,
+    O1R5G5B5_UNORM = 0xFC,
+    Z8R8G8B8_UNORM = 0xFD,
+    O8R8G8B8_UNORM = 0xFE,
+    R32_UNORM = 0xFF,
+    A16_UNORM = 0x40,
+    A16_FLOAT = 0x41,
+    A32_FLOAT = 0x42,
+    A8R8_UNORM = 0x43,
+    R16A16_UNORM = 0x44,
+    R16A16_FLOAT = 0x45,
+    R32A32_FLOAT = 0x46,
+    B8G8R8A8_UNORM = 0x47,
+    */
+};
+
+enum class DepthFormat : u32 {
+    Z32_FLOAT = 0xA,
+    Z16_UNORM = 0x13,
+    Z24_UNORM_S8_UINT = 0x14,
+    X8Z24_UNORM = 0x15,
+    S8Z24_UNORM = 0x16,
+    S8_UINT = 0x17,
+    V8Z24_UNORM = 0x18,
+    Z32_FLOAT_X24S8_UINT = 0x19,
+    /*
+    X8Z24_UNORM_X16V8S8_UINT = 0x1D,
+    Z32_FLOAT_X16V8X8_UINT = 0x1E,
+    Z32_FLOAT_X16V8S8_UINT = 0x1F,
+    */
+};
+} // namespace Tegra

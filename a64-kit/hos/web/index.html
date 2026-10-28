@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TOTK web test</title>
+<style>
+  :root { --bg: #0b0c0e; --fg: #d8dade; --dim: #8a8f98; --accent: #6fbf73; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 13px/1.4 system-ui, sans-serif; }
+  #wrap { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 12px 16px; }
+  canvas { width: min(100%, 1280px); aspect-ratio: 16 / 9; background: #000; border-radius: 6px; cursor: pointer; }
+  canvas:fullscreen { width: 100vw; height: 100vh; aspect-ratio: auto; border-radius: 0; }
+  #bar { display: flex; gap: 16px; width: min(100%, 1280px); color: var(--dim); flex-wrap: wrap; }
+  #status { color: var(--accent); }
+  #log { width: min(100%, 1280px); height: 220px; overflow: auto; background: #111317; border-radius: 6px; padding: 8px;
+         box-sizing: border-box; font: 12px/1.35 ui-monospace, Consolas, monospace; white-space: pre-wrap; color: var(--dim); }
+  #credit { color: var(--dim); font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="screen" width="1280" height="720"></canvas>
+  <canvas id="canvas" width="1" height="1" hidden></canvas>
+  <div id="bar"><span id="status">loading...</span><span id="fps"></span>
+    <span>WASD move, mouse camera (click to capture), E/Space/Shift/F/R buttons, Enter = +, or plug in a controller (press a button); double-click: full screen</span></div>
+  <div id="log"></div>
+  <div id="credit">Powered by Rexcomp &middot; by NotRexed</div>
+</div>
+<script>
+const logEl = document.getElementById('log'), statusEl = document.getElementById('status'), fpsEl = document.getElementById('fps');
+let logLines = [];
+const keepFullLog = new URLSearchParams(location.search).has('autolog') || new URLSearchParams(location.search).has('fulllog');
+const fullLog = [];   // (everything, for debugging: uploaded with fetch('/upload/log.txt', {method: 'PUT', body: fullLog.join(String.fromCharCode(10))}))
+const t0 = performance.now();
+let logQueued = false;
+function log(s) {
+  s = '[' + ((performance.now() - t0) / 1000).toFixed(1) + 's] ' + s;   // (seconds since the page opened)
+  if (fullLog.length < 400000) fullLog.push(s);
+  if (!keepFullLog && fullLog.length > 20000) fullLog.splice(0, 10000);
+  logLines.push(s);
+  if (logLines.length > 400) logLines = logLines.slice(-300);
+  if (logQueued) return;
+  logQueued = true;
+  requestAnimationFrame(() => {
+    logQueued = false;
+    logEl.textContent = logLines.join('\n');
+    logEl.scrollTop = logEl.scrollHeight;
+  });
+}
+  // The page needs cross-origin isolation (COOP/COEP) for SharedArrayBuffer, which both the wasm threads and the
+  // audio ring buffer use. Serving from file:// or from a server that drops those headers leaves the feature off.
+  if (!crossOriginIsolated) {
+    statusEl.textContent = 'not cross-origin isolated: SharedArrayBuffer unavailable';
+    log('cross-origin isolated: no (file:// or missing COOP/COEP headers)');
+  } else {
+    log('cross-origin isolated: yes');
+  }
+  if (!navigator.gpu) statusEl.textContent = 'this browser has no WebGPU';
+
+const screen = document.getElementById('screen');
+let frames = 0, lastFps = performance.now(), lastFrame = 0;
+let shown = 0, lastShownLog = performance.now();   // (the frames the canvas showed, logged every 5 s: what the player sees)
+const vk = (code) => {
+  if (code.startsWith('Key')) return code.charCodeAt(3);
+  if (code.startsWith('Digit')) return code.charCodeAt(5);
+  return {ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, Space: 32, ShiftLeft: 16, ShiftRight: 16,
+          ControlLeft: 17, ControlRight: 17, AltLeft: 18, Enter: 13, Tab: 9, Escape: 27, Minus: 189, Equal: 187,
+          NumpadAdd: 107, NumpadSubtract: 109}[code] || 0;
+};
+
+// IndexedDB: the renderer's pipeline cache between visits
+const idbOpen = () => new Promise((res, rej) => {
+  const r = indexedDB.open('rx-cache', 1);
+  r.onupgradeneeded = () => r.result.createObjectStore('files');
+  r.onsuccess = () => res(r.result);
+  r.onerror = () => rej(r.error);
+});
+const idbGet = async (key) => {
+  const db = await idbOpen();
+  return new Promise((res) => {
+    const q = db.transaction('files').objectStore('files').get(key);
+    q.onsuccess = () => res(q.result || null);
+    q.onerror = () => res(null);
+  });
+};
+const idbPut = async (key, value) => {
+  const db = await idbOpen();
+  return new Promise((res) => {
+    const t = db.transaction('files', 'readwrite');
+    t.objectStore('files').put(value, key);
+    t.oncomplete = t.onerror = () => res();
+  });
+};
+let cacheSaved = 0, cacheChunks = 0;
+const saveCache = () => {   // (the renderer appends to the file every 10 s when it made new pipelines)
+  try {
+    const path = '/rxcache/pipelines.bin';
+    const st = Module.FS.stat(path);
+    if (st.size == cacheSaved) return;
+    if (st.size < cacheSaved || !cacheSaved) {
+      const data = Module.FS.readFile(path);
+      cacheSaved = st.size;
+      cacheChunks = 0;
+      idbPut('pipelines.bin', data.slice().buffer);
+      idbPut('pipelines.chunks', 0);
+      return;
+    }
+    const n = st.size - cacheSaved, part = new Uint8Array(n);
+    const f = Module.FS.open(path, 'r');
+    Module.FS.read(f, part, 0, n, cacheSaved);
+    Module.FS.close(f);
+    idbPut('pipelines.chunk.' + cacheChunks, part.buffer);
+    cacheChunks++;
+    idbPut('pipelines.chunks', cacheChunks);
+    cacheSaved = st.size;
+  } catch (e) {}
+};
+setInterval(saveCache, 15000);
+// ?autolog=<name> (debugging, with tools/serve_web.py): the page log is uploaded every 30 s as <name>
+const autolog = new URLSearchParams(location.search).get('autolog');
+if (autolog) setInterval(() => fetch('/upload/' + autolog, {method: 'PUT', body: fullLog.join(String.fromCharCode(10))}), 30000);
+addEventListener('pagehide', saveCache);
+
+var Module = {
+  canvas: document.getElementById('canvas'),   // (Emscripten hands this one to its main thread; #screen goes to the renderer)
+  arguments: ['image.bin', '--romfs', 'romfs', '--user', '/user'],
+  // ?env=NAME=value,NAME=value: the game's environment (HOS_*, RX_* settings)
+  preRun: [() => {
+    const env = new URLSearchParams(location.search).get('env');
+    if (env) for (const kv of env.split(/,(?=[A-Z][A-Z0-9_]*=)/)) { /* (commas in a value stay: HOS_INPUT_SCRIPT) */ const i = kv.indexOf('='); if (i > 0) Module.ENV[kv.slice(0, i)] = kv.slice(i + 1); }
+    // The renderer's pipeline cache (gpu/render/rx_pipecache.cpp): /rxcache/pipelines.bin from IndexedDB, and
+    // pipelines.bin from the server when there is one (/rxcache/seed.bin), before the game starts
+    Module.FS.mkdir('/rxcache');
+    Module.addRunDependency('rxcache');
+    (async () => {
+      try {
+        const cached = await idbGet('pipelines.bin');
+        const parts = cached ? [new Uint8Array(cached)] : [];
+        const chunks = cached ? (await idbGet('pipelines.chunks')) || 0 : 0;
+        for (let i = 0; i < chunks; i++) {
+          const c = await idbGet('pipelines.chunk.' + i);
+          if (!c) break;
+          parts.push(new Uint8Array(c));
+        }
+        const total = parts.reduce((t, p) => t + p.length, 0), whole = new Uint8Array(total);
+        let at = 0;
+        for (const p of parts) { whole.set(p, at); at += p.length; }
+        if (total) Module.FS.writeFile('/rxcache/pipelines.bin', whole);
+        cacheSaved = total;
+        cacheChunks = Math.max(0, parts.length - 1);
+        if (cacheChunks > 32) {
+          idbPut('pipelines.bin', whole.slice().buffer);
+          idbPut('pipelines.chunks', 0);
+          cacheChunks = 0;
+        }
+      } catch (e) { console.warn('pipeline cache: ' + e); }
+      try {
+        const r = await fetch('pipelines.bin');
+        if (r.ok) Module.FS.writeFile('/rxcache/seed.bin', new Uint8Array(await r.arrayBuffer()));
+      } catch (e) {}
+    })().finally(() => Module.removeRunDependency('rxcache'));
+    // ?save=<name> (with tools/serve_web.py): the game starts from that save folder (<build>/<name>, e.g.
+    // user_sky_base), copied into this page's /user (the folder on disk is never written)
+    const save = new URLSearchParams(location.search).get('save');
+    if (save) {
+      Module.addRunDependency('save');
+      (async () => {
+        const files = await (await fetch('saves/' + save + '.json')).json();
+        for (const rel of Object.keys(files)) {
+          const data = new Uint8Array(await (await fetch('saves/' + save + '/' + rel)).arrayBuffer());
+          const path = '/user/' + rel;
+          Module.FS.mkdirTree(path.slice(0, path.lastIndexOf('/')));
+          Module.FS.writeFile(path, data);
+        }
+        log('save: ' + save + ' (' + Object.keys(files).length + ' files)');
+      })().catch((e) => log('save: ' + e)).finally(() => Module.removeRunDependency('save'));
+    }
+  }],
+  print: (s) => { console.log(s); log(s); },
+  printErr: (s) => { console.log(s); log(s); },
+  rxFrame: () => {   // (the render thread draws into the canvas itself: transferred to it)
+    frames++;
+    shown++;
+    const now = performance.now();
+    if (now - lastShownLog > 5000) {
+      log('page: ' + (shown * 1000 / (now - lastShownLog)).toFixed(1) + ' fps shown');
+      shown = 0;
+      lastShownLog = now;
+    }
+    if (lastFrame && now - lastFrame > 1000) log('stall: no frame for ' + ((now - lastFrame) / 1000).toFixed(1) + ' s');
+    lastFrame = now;
+    if (now - lastFps > 1000) {
+      fpsEl.textContent = (frames * 1000 / (now - lastFps)).toFixed(1) + ' fps';
+      frames = 0;
+      lastFps = now;
+    }
+  },
+  onRuntimeInitialized: () => {
+    statusEl.textContent = 'running';
+    // the canvas's size in device pixels, whenever it changes (a window resize, full screen): the renderer draws at
+    // that size (the game's frame keeps its aspect; FSR 1 upscales it when larger)
+    const screenEl = document.getElementById('screen');
+    // ?aspect=21/9 (or 2.37): the canvas's shape on the page (an ultrawide view without full screen)
+    const aspectParam = new URLSearchParams(location.search).get('aspect');
+    if (aspectParam) screenEl.style.aspectRatio = aspectParam.replace(':', ' / ');
+    const sendSize = () => {
+      const r = screenEl.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+      Module._web_resize(Math.max(1, Math.round(r.width * dpr)), Math.max(1, Math.round(r.height * dpr)));
+    };
+    new ResizeObserver(sendSize).observe(screenEl);
+    addEventListener('resize', sendSize);
+    sendSize();
+    // F6 ultrawide, F7 frame interpolation, F8 FSR, F9 sharpness, F10 fit/stretch (kept in the save's present.txt)
+    addEventListener('keydown', (e) => {
+      const k = ['F6', 'F7', 'F8', 'F9', 'F10'].indexOf(e.key);
+      if (k < 0 || e.repeat) return;
+      e.preventDefault();
+      Module._web_present_hotkey(6 + k);
+      if (k === 0) sendSize();
+    });
+    screenEl.addEventListener('dblclick', () => {
+      if (document.fullscreenElement) document.exitFullscreen();
+      else screenEl.requestFullscreen().catch((e) => log('full screen: ' + e));
+    });
+    // (>>> : these live above 2 GB of wasm memory (the guest window is below them): the exports return them signed)
+    const keys = Module._web_keys_address() >>> 0, mouse = Module._web_mouse_address() >>> 2;
+    const pad = Module._web_pad_address() >>> 2;
+    const setKey = (e, down) => {
+      const k = vk(e.code);
+      if (!k) return;
+      Module.HEAPU8[keys + k] = down ? 1 : 0;
+      if (k != 27) e.preventDefault();
+    };
+    addEventListener('keydown', (e) => setKey(e, true));
+    addEventListener('keyup', (e) => setKey(e, false));
+    const releaseKeys = () => Module.HEAPU8.fill(0, keys, keys + 256);
+    addEventListener('blur', releaseKeys);
+    document.addEventListener('visibilitychange', () => { if (document.hidden) releaseKeys(); });
+    screen.addEventListener('click', () => screen.requestPointerLock());
+    document.addEventListener('pointerlockchange', () => {
+      Atomics.store(Module.HEAP32, mouse + 2, document.pointerLockElement === screen ? 1 : 0);
+    });
+    addEventListener('mousemove', (e) => {
+      if (document.pointerLockElement !== screen) return;
+      Atomics.add(Module.HEAP32, mouse, e.movementX | 0);
+      Atomics.add(Module.HEAP32, mouse + 1, e.movementY | 0);
+    });
+    addEventListener('mousedown', (e) => { if (document.pointerLockElement === screen) Module.HEAPU8[keys + (e.button == 2 ? 2 : 1)] = 1; });
+    addEventListener('mouseup', (e) => { Module.HEAPU8[keys + (e.button == 2 ? 2 : 1)] = 0; });
+    // Controller: the first pad with the standard mapping, polled every 4 ms into web_pad[] as XInput
+    // sees it (connected, buttons, triggers 0..255, LX LY RX RY with up positive, packet)
+    const XB = [0x1000, 0x2000, 0x4000, 0x8000, 0x0100, 0x0200, 0, 0, 0x0020, 0x0010, 0x0040, 0x0080,
+                0x0001, 0x0002, 0x0004, 0x0008];
+    let packet = 0, padName = '';
+    const axis = (v) => Math.max(-32767, Math.min(32767, Math.round(v * 32767)));
+    const pollPad = () => {
+      const pads = [...(navigator.getGamepads ? navigator.getGamepads() : [])].filter((g) => g && g.connected);
+      const p = pads.find((g) => g.mapping == 'standard') || pads[0];
+      const H = Module.HEAP32;
+      if (!p) {
+        Atomics.store(H, pad, 0);
+      } else {
+        if (p.id != padName) { padName = p.id; log('controller: ' + p.id + ' (mapping: ' + (p.mapping || 'none') + ')'); }
+        let b = 0;
+        for (let i = 0; i < XB.length && i < p.buttons.length; i++) if (p.buttons[i].pressed) b |= XB[i];
+        const trig = (i) => p.buttons[i] ? Math.round(p.buttons[i].value * 255) : 0;
+        const ax = (i) => p.axes[i] || 0;
+        H[pad + 1] = b;
+        H[pad + 2] = trig(6);
+        H[pad + 3] = trig(7);
+        H[pad + 4] = axis(ax(0));
+        H[pad + 5] = axis(-ax(1));
+        H[pad + 6] = axis(ax(2));
+        H[pad + 7] = axis(-ax(3));
+        H[pad + 8] = ++packet;
+        Atomics.store(H, pad, 1);
+      }
+    };
+    addEventListener('gamepadconnected', (e) => log('controller connected: ' + e.gamepad.id));
+    // Audio: the game's mix (48 kHz stereo, 16-bit) is a ring in the wasm memory (hos/web/win32.c, web_audio); an
+    // AudioWorklet plays it from the shared memory. Browsers start audio only after a click or a key press.
+    const audioBase = Module._web_audio_address() >>> 0;
+    let audioStarted = false;
+    const startAudio = async () => {
+      if (audioStarted) return;
+      audioStarted = true;
+      try {
+        const ctx = new AudioContext({sampleRate: 48000, latencyHint: 'interactive'});
+        const src = `class RxAudio extends AudioWorkletProcessor {
+          constructor(o) {
+            super();
+            const {buf, base} = o.processorOptions;
+            this.head = new Int32Array(buf, base, 4);
+            this.size = this.head[2];
+            this.pcm = new Int16Array(buf, base + 16, this.size * 2);
+          }
+          process(inputs, outputs) {
+            const out = outputs[0], L = out[0], R = out[1] || out[0], n = L.length, size = this.size;
+            const wr = Atomics.load(this.head, 0);
+            let rd = Atomics.load(this.head, 1), avail = wr - rd;
+            if (avail > 9600) { rd = wr - 2400; avail = 2400; }   // (over 200 ms behind: catch up to 50 ms)
+            for (let i = 0; i < n; i++) {
+              if (avail > 0) {
+                const k = (rd % size) * 2;
+                L[i] = this.pcm[k] / 32768;
+                R[i] = this.pcm[k + 1] / 32768;
+                rd++;
+                avail--;
+              } else {
+                L[i] = R[i] = 0;
+              }
+            }
+            Atomics.store(this.head, 1, rd);
+            return true;
+          }
+        }
+        registerProcessor('rx-audio', RxAudio);`;
+        await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([src], {type: 'text/javascript'})));
+        // (the read count starts where the game is: what it mixed before nobody heard)
+        Atomics.store(Module.HEAP32, (audioBase >>> 2) + 1, Atomics.load(Module.HEAP32, audioBase >>> 2));
+        const node = new AudioWorkletNode(ctx, 'rx-audio', {numberOfInputs: 0, outputChannelCount: [2],
+                                                          processorOptions: {buf: Module.HEAPU8.buffer, base: audioBase}});
+        node.connect(ctx.destination);
+        await ctx.resume();
+        log('audio: playing (' + ctx.sampleRate + ' Hz)');
+      } catch (e) {
+        log('audio: ' + e);
+      }
+    };
+    addEventListener('pointerdown', startAudio);
+    addEventListener('keydown', startAudio);
+    setInterval(pollPad, 4);   // (a timer, not animation frames: the game reads the pad between its own frames)
+  },
+};
+</script>
+<script src="totk.js"></script>
+</body>
+</html>

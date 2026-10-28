@@ -1,0 +1,253 @@
+/* Horizon OS layer, native host: process start and boot.
+
+   What rtld and nn::init::Start do on hardware (see ports/zelda-totk/PORT.md, "How the game starts"), done here:
+   map the guest window, load the relocated image (nx_image.py already linked it), make this host thread the
+   guest main thread, run every module's DT_INIT in rtld's order (the SDK crt's _init: TLS registration with musl,
+   then the module's constructors), then nninitStartup and nnMain.
+
+   Usage: <game>.exe [image.bin --romfs <dir> --user <dir>]
+   Native Windows defaults: image.bin, romfs/ and user/ beside the executable.
+   Environment: HOS_TRACE=1 (log HLE calls), HOS_MEMORY_MB (memory the game is told it has),
+                HOS_NVN_CONTINUE=1 (go on past nvnBootstrapLoader). */
+#include "hos.h"
+#include <stdio.h>
+#include <stdlib.h>
+#if defined(_WIN32) || defined(__EMSCRIPTEN__)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <mmsystem.h>
+#else
+#include <sys/mman.h>
+#endif
+
+#ifdef A64_MEM_ZERO
+/* web: guest address = wasm address; the guest window is wasm memory below the host's data (-sGLOBAL_BASE) */
+extern char __global_base;
+uint64_t hos_space_end;
+#define GUEST_SPACE (hos_space_end)
+#else
+#define GUEST_SPACE (1ULL << 32)
+#endif
+#define IMAGE_BASE 0x08000000ULL   /* nx_image.MAIN_BASE */
+
+#ifdef _WIN32
+static void no_power_throttling(void) {
+    const char *e = getenv("HOS_POWER_THROTTLING");
+    if (e && atoi(e)) return;
+    typedef BOOL(WINAPI * SetInfo)(HANDLE, int, LPVOID, DWORD);
+    SetInfo set = (SetInfo)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "SetProcessInformation");
+    if (!set) return;
+    struct { ULONG version, control, state; } s = {1, 0x1 | 0x4, 0};
+    if (!set(GetCurrentProcess(), 4, &s, sizeof s)) {
+        s.control = 0x1;
+        set(GetCurrentProcess(), 4, &s, sizeof s);
+    }
+}
+#endif
+
+#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+/* Keep defaults absolute so Explorer and other working directories all use this installation. */
+static char standalone_image[32768], standalone_romfs[32768], standalone_user[32768];
+static int standalone_paths(void) {
+    char exe[32768];
+    DWORD n = GetModuleFileNameA(NULL, exe, (DWORD)sizeof exe);
+    if (!n || n >= sizeof exe) return 0;
+    char *slash = strrchr(exe, '\\');
+    if (!slash) return 0;
+    *slash = 0;
+    return snprintf(standalone_image, sizeof standalone_image, "%s\\image.bin", exe) < (int)sizeof standalone_image &&
+           snprintf(standalone_romfs, sizeof standalone_romfs, "%s\\romfs", exe) < (int)sizeof standalone_romfs &&
+           snprintf(standalone_user, sizeof standalone_user, "%s\\user", exe) < (int)sizeof standalone_user;
+}
+#endif
+
+/* gen/hos_image.c (build.py lift) */
+extern const uint64_t hos_image_end, hos_main_stack_size;
+extern const int hos_main_priority, hos_main_core, hos_module_count;
+extern const uint64_t hos_module_init[];
+extern const char *const hos_module_name[];
+extern const uint64_t hos_entry_nninitStartup, hos_entry_nnMain;
+extern const uint64_t hos_entry_init_libc0, hos_entry_init_libc1, hos_entry_init_libc2, hos_entry_nnosInitialize,
+    hos_entry_nninitInitializeSdkModule;
+/* nn_fs.c */
+extern const char *hos_romfs_dir, *hos_user_dir;
+
+/* HOS_LARGE_PAGES=1 (experiment): the guest window in 2 MB pages, for fewer TLB misses (the game touches hundreds of MB
+   of scattered heap; 4 KB pages cover only ~12 MB of it in the CPU's TLB). The whole window is then physical memory at
+   once (4 GB, locked), and Windows needs the account to hold "Lock pages in memory" (SeLockMemoryPrivilege, Local
+   Security Policy > User Rights Assignment; log off and on after): without it this logs why and uses normal pages. */
+int hos_large_pages;   /* (hos_mem.c: freed pages are not discarded then) */
+#if defined(_WIN32) && !defined(A64_MEM_ZERO)
+#pragma comment(lib, "advapi32.lib")   /* (the token privilege calls) */
+static void *reserve_large(SIZE_T size) {
+    HANDLE token;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) return NULL;
+    TOKEN_PRIVILEGES tp = {0};
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    const BOOL looked = LookupPrivilegeValueA(NULL, "SeLockMemoryPrivilege", &tp.Privileges[0].Luid);
+    const BOOL adjusted = looked && AdjustTokenPrivileges(token, FALSE, &tp, 0, NULL, NULL);
+    const DWORD err = GetLastError();
+    CloseHandle(token);
+    if (!adjusted || err == ERROR_NOT_ALL_ASSIGNED) {
+        hos_log("mem: HOS_LARGE_PAGES: this account does not hold SeLockMemoryPrivilege (\"Lock pages in memory\"): "
+                "normal pages");
+        return NULL;
+    }
+    const SIZE_T large = GetLargePageMinimum();
+    if (!large || size % large) return NULL;
+    void *p = VirtualAlloc((void *)A64_HOST_BASE, size, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
+    if (!p) hos_log("mem: HOS_LARGE_PAGES: %llu MB of large pages not available (error %lu): normal pages",
+                    (unsigned long long)(size >> 20), GetLastError());
+    return p;
+}
+#endif
+
+/* The guest window lives at the constant A64_HOST_BASE (rt/a64.h), so lifted code never loads its base. */
+static int reserve_guest(void) {
+#if defined(A64_MEM_ZERO)
+    hos_space_end = (uint64_t)(uintptr_t)&__global_base & ~0xFFFFULL;
+    return hos_space_end >= (1ULL << 30);
+#elif defined(_WIN32)
+    /* Committed but untouched pages cost no physical memory. Write-watched: the renderer's buffer cache asks which
+       pages changed (GetWriteWatch) so that it uploads only those (soft write watch builds mark pages themselves). */
+#if defined(A64_WRITE_TRACK)
+    const DWORD watch = 0;
+    if (getenv("HOS_LARGE_PAGES") && reserve_large(GUEST_SPACE) == (void *)A64_HOST_BASE) {
+        hos_large_pages = 1;
+        hos_log("mem: the guest window is in large pages (%llu MB)", (unsigned long long)(GUEST_SPACE >> 20));
+        return 1;
+    }
+#else
+    const DWORD watch = MEM_WRITE_WATCH;
+#endif
+    return VirtualAlloc((void *)A64_HOST_BASE, GUEST_SPACE, MEM_RESERVE | MEM_COMMIT | watch,
+                        PAGE_READWRITE) == (void *)A64_HOST_BASE;
+#else
+    return mmap((void *)A64_HOST_BASE, GUEST_SPACE, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE, -1, 0) == (void *)A64_HOST_BASE;
+#endif
+}
+
+/* The guest window, for the renderer (gpu/render/rx_buffer.cpp). */
+uint8_t *hos_guest_base(void) { return A64_MEM; }
+uint64_t hos_guest_size(void) { return GUEST_SPACE; }
+
+/* Call guest code at `addr` as a fresh call from the top of the main thread's stack, with whatever arguments the
+   caller put in x0-x7 (call_guest clears x0 and x1 first; call_guest_args keeps them). */
+static void call_guest_args(Ctx *c, uint64_t addr, uint64_t sp, const char *what) {
+    A64Fn f = a64_lookup(addr);
+    if (!addr || !f) hos_fatal(c, "%s: no function at %#llx", what, (unsigned long long)addr);
+    hos_log("boot: %s (%#llx)", what, (unsigned long long)addr);
+    c->x[30] = 0;
+    c->x[31] = sp;
+    void hos_mem_checkpoint(const char *what);
+    hos_mem_checkpoint(what);
+    f(c);
+}
+static void call_guest(Ctx *c, uint64_t addr, uint64_t sp, const char *what) {
+    c->x[0] = c->x[1] = 0;
+    call_guest_args(c, addr, sp, what);
+}
+
+int main(int argc, char **argv) {
+    const char *image = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--romfs") && i + 1 < argc) hos_romfs_dir = argv[++i];
+        else if (!strcmp(argv[i], "--user") && i + 1 < argc) hos_user_dir = argv[++i];
+        else if (!strcmp(argv[i], "--trace")) hos_trace = 1;
+        else if (!image) image = argv[i];
+    }
+#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+    if (!standalone_paths()) {
+        fprintf(stderr, "cannot determine the executable's folder\n");
+        return 1;
+    }
+    if (!image) image = standalone_image;
+    if (!hos_romfs_dir) hos_romfs_dir = standalone_romfs;
+    if (!hos_user_dir) hos_user_dir = standalone_user;
+    DWORD romfs_attributes = GetFileAttributesA(hos_romfs_dir);
+    if (romfs_attributes == INVALID_FILE_ATTRIBUTES || !(romfs_attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        fprintf(stderr, "RomFS folder not found: %s\n", hos_romfs_dir);
+        return 1;
+    }
+#else
+    if (!image) {
+        fprintf(stderr, "usage: %s image.bin --romfs <dir> --user <dir> [--trace]\n", argv[0]);
+        return 2;
+    }
+#endif
+    if (getenv("HOS_TRACE")) hos_trace = 1;
+    if (!hos_user_dir) hos_user_dir = "user";
+    CreateDirectoryA(hos_user_dir, NULL);
+    if (!reserve_guest()) {
+        fprintf(stderr, "cannot reserve the guest window\n");
+        return 1;
+    }
+#ifdef A64_MEM_ZERO
+    web_fs_init(NULL, hos_romfs_dir);
+    /* (the whole file, no range: the server sends it brotli-compressed, 85 -> 26 MB) */
+    const int got = web_fetch_all(image, A64_MEM + IMAGE_BASE, GUEST_SPACE - IMAGE_BASE);
+    if (got < 0) {
+        fprintf(stderr, "cannot fetch %s\n", image);
+        return 1;
+    }
+    size_t n = (size_t)got;
+#else
+    FILE *f = fopen(image, "rb");
+    if (!f) {
+        fprintf(stderr, "cannot open %s\n", image);
+        return 1;
+    }
+    /* exactly the file's size: a read into "the rest of the guest window" (~4 GB) made Windows commit physical memory
+       for ~2 GB of it before the game ran (the whole heap was resident from the start, ~1.3 GB of it never used) */
+    fseek(f, 0, SEEK_END);
+    const long long file_size = _ftelli64(f);
+    fseek(f, 0, SEEK_SET);
+    size_t n = file_size > 0 && (uint64_t)file_size <= GUEST_SPACE - IMAGE_BASE
+                   ? fread(A64_MEM + IMAGE_BASE, 1, (size_t)file_size, f) : 0;
+    fclose(f);
+#endif
+    if (IMAGE_BASE + n != hos_image_end) {
+        fprintf(stderr, "%s: %zu bytes, the lifted code expects %#llx: lift and image do not match\n", image, n,
+                (unsigned long long)(hos_image_end - IMAGE_BASE));
+        return 1;
+    }
+    hos_mem_init(hos_image_end);
+    hos_log("boot: image %zu MB at %#llx, %llu MB of memory for the game", n >> 20, IMAGE_BASE,
+            (unsigned long long)(hos_total_memory >> 20));
+    void hos_mods_init(const char *image_path);
+    hos_mods_init(image);   /* mods.c: <exe folder>\mods (RomFS files, exefs data patches) */
+
+    Ctx *c = hos_boot_main_thread(hos_main_stack_size);
+    uint64_t sp = c->x[31];
+    void hos_prof_start(void);
+    hos_prof_start();   /* HOS_PROFILE=<seconds> */
+#ifdef _WIN32
+    timeBeginPeriod(1);   /* 1 ms timer resolution: the 60 Hz vsync and the game's frame pacing sleep in short steps */
+    no_power_throttling();
+#endif
+    void hos_display_start(void);
+    hos_display_start();  /* the game's window; HOS_HEADLESS=1 for none */
+    /* nn::init::Start's order (sdk+0xfa060), with rtld's three callbacks done here: f1 only marks rtld initialized,
+       f2 is every module's DT_INIT, f3 the DT_FINIs (not needed: we never return from nnMain to unload). */
+    call_guest(c, hos_entry_init_libc0, sp, "_init_libc0");
+    c->x[0] = hos_thread_handle(hos_self());   /* the main thread's handle */
+    c->x[1] = 0;                               /* program arguments: none (an unmapped address) */
+    call_guest_args(c, hos_entry_nnosInitialize, sp, "nnosInitialize");
+    void hos_thread_adopt_guest(HosThread *t);
+    hos_thread_adopt_guest(hos_self());
+    call_guest(c, hos_entry_init_libc1, sp, "_init_libc1");
+    /* nninitInitializeSdkModule (sdk+0xfa000) only opens the SDK's service clients (sm:, diag, oe, aoc, err, fs,
+       pctl) over IPC; the HLE stands in for every one of them, so it is not run. */
+    call_guest(c, hos_entry_nninitStartup, sp, "nninitStartup");
+    call_guest(c, hos_entry_init_libc2, sp, "_init_libc2");
+    for (int i = 0; i < hos_module_count; i++) {
+        char what[64];
+        snprintf(what, sizeof what, "%s DT_INIT", hos_module_name[i]);
+        call_guest(c, hos_module_init[i], sp, what);
+    }
+    call_guest(c, hos_entry_nnMain, sp, "nnMain");
+    hos_log("nnMain returned");
+    return 0;
+}

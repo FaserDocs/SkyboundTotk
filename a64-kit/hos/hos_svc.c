@@ -1,0 +1,358 @@
+/* Horizon supervisor calls that lifted SDK code still makes (the game itself has none; the SDK has ~60 wrappers).
+   The HLE above nn:: should keep most of them from ever running: what reaches here is either trivial
+   (debug output, ticks, info queries) or a sign that an SDK function above it wants an HLE. Unknown ones stop the
+   run with the svc number and the caller, so the log says what to do next. Numbers: switchbrew.org "SVC". */
+#include "hos.h"
+#include <stdio.h>
+#include <stdlib.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+#define R_OK 0
+#define R_INVALID_ENUM 0xF001   /* svc::ResultInvalidEnumValue */
+
+static uint64_t get_info(uint32_t id0, uint64_t id1, int *ok) {
+    *ok = 1;
+    switch (id0) {
+    case 0: return (1u << hos_cores()) - 1;               /* CoreMask: cores 0-2 */
+    case 1: return 0xFFFFFFFFFFFFFFFFULL;                  /* PriorityMask */
+    case 2: return HOS_HEAP_BASE;                          /* AliasRegionAddress */
+    case 3: return HOS_SPACE_END - HOS_HEAP_BASE;          /* AliasRegionSize */
+    case 4: return HOS_HEAP_BASE;                          /* HeapRegionAddress */
+    case 5: return HOS_SPACE_END - HOS_HEAP_BASE;          /* HeapRegionSize */
+    case 6: return hos_total_memory;                       /* TotalMemorySize */
+    case 7: return hos_program_size + hos_heap_size;       /* UsedMemorySize */
+    case 8: return 0;                                      /* DebuggerAttached */
+    case 11: return 0x5A3C9E1F0B7D2468ULL ^ (id1 * 0x9E3779B97F4A7C15ULL);   /* RandomEntropy */
+    case 12: return 0x08000000ULL;                         /* AslrRegionAddress */
+    case 13: return HOS_SPACE_END - 0x08000000ULL;         /* AslrRegionSize */
+    case 14: return HOS_SYSTEM_BASE;                       /* StackRegionAddress */
+    case 15: return HOS_SYSTEM_END - HOS_SYSTEM_BASE;      /* StackRegionSize */
+    case 16: case 17: return 0;                            /* SystemResourceSize total / used */
+    case 18: return 0x0100F2C0115B6000ULL;                 /* ProgramId: set per title by hos_main (TODO) */
+    case 21: return hos_total_memory;                      /* TotalNonSystemMemorySize */
+    case 22: return hos_program_size + hos_heap_size;      /* UsedNonSystemMemorySize */
+    case 23: return 1;                                     /* IsApplication */
+    default: *ok = 0; return 0;
+    }
+}
+
+/* ---- mutex arbitration and process-wide condition variables -------------------------------------------------
+   Horizon's user-mode mutex: the word holds the owner's handle, bit 30 means "has waiters". A thread that loses the
+   race sets bit 30 and calls ArbitrateLock; the owner's ArbitrateUnlock hands the word straight to the
+   highest-priority waiter. A condition variable wait releases the mutex and sleeps on the key; a signal moves a
+   waiter back to its mutex, or gives it the mutex if free (switchbrew "SVC", libnx mutex.c / condvar.c). */
+#define HANDLE_WAIT_MASK 0x40000000u
+#define R_TIMED_OUT 0xEA01
+
+typedef struct { HosThread *t; uint64_t mutex, key; uint32_t tag; int on_key; } Waiter;
+static Waiter waiters[1024];
+static int nwaiters;
+static SRWLOCK klock = SRWLOCK_INIT;
+
+static uint32_t word_get(uint64_t a) { return __atomic_load_n((uint32_t *)GP(a), __ATOMIC_SEQ_CST); }
+static void word_set(uint64_t a, uint32_t v) { __atomic_store_n((uint32_t *)GP(a), v, __ATOMIC_SEQ_CST); }
+/* User mode changes a mutex word with exclusives (compare-and-swap here) while the kernel holds klock: a kernel
+   read-modify-write of a word user mode may change must be a compare-and-swap too. */
+static int word_cas(uint64_t a, uint32_t expect, uint32_t v) {
+    return __atomic_compare_exchange_n((uint32_t *)GP(a), &expect, v, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+}
+
+/* The best waiter (lowest priority value, then oldest) for a mutex (on_key 0) or a key (on_key 1). */
+static int best_waiter(uint64_t addr, int on_key, int *others) {
+    int best = -1;
+    *others = 0;
+    for (int i = 0; i < nwaiters; i++) {
+        Waiter *w = &waiters[i];
+        if (w->on_key != on_key || (on_key ? w->key : w->mutex) != addr) continue;
+        if (best < 0) best = i;
+        else {
+            (*others)++;
+            if (hos_thread_prio(w->t) < hos_thread_prio(waiters[best].t)) best = i;
+        }
+    }
+    return best;
+}
+static void remove_waiter(int i) { memmove(&waiters[i], &waiters[i + 1], (nwaiters - i - 1) * sizeof *waiters); nwaiters--; }
+static int find_thread(HosThread *t) {
+    for (int i = 0; i < nwaiters; i++) if (waiters[i].t == t) return i;
+    return -1;
+}
+
+/* Hand a held mutex to its next waiter, or free it. Caller holds klock. */
+static void release_locked(uint64_t mutex) {
+    int others, i = best_waiter(mutex, 0, &others);
+    if (i < 0) { word_set(mutex, 0); return; }
+    Waiter w = waiters[i];
+    remove_waiter(i);
+    word_set(mutex, w.tag | (others ? HANDLE_WAIT_MASK : 0));
+    hos_thread_wake(w.t);
+}
+
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__EMSCRIPTEN__)
+#include <emmintrin.h>
+static int spin_for_release(uint64_t mutex, uint32_t held) {
+    static int64_t limit = -1;
+    if (limit < 0) {
+        const char *e = getenv("HOS_SPIN_US");
+        limit = (e ? atoll(e) : 20) * 1000;
+    }
+    static int misses[256], tries[256];
+    const unsigned slot = (unsigned)(mutex >> 3 ^ mutex >> 11) & 255;
+    const int m = __atomic_load_n(&misses[slot], __ATOMIC_RELAXED);
+    if (limit <= 0 || (m >= 4 && (__atomic_add_fetch(&tries[slot], 1, __ATOMIC_RELAXED) & 31))) return 0;
+    const int64_t end = hos_now_ns() + limit;
+    for (;;) {
+        for (int i = 0; i < 16; i++) {
+            if (word_get(mutex) != held) {
+                __atomic_store_n(&misses[slot], 0, __ATOMIC_RELAXED);
+                return 1;
+            }
+            _mm_pause();
+        }
+        if (hos_now_ns() >= end) {
+            if (m < 4) __atomic_store_n(&misses[slot], m + 1, __ATOMIC_RELAXED);
+            return 0;
+        }
+    }
+}
+#else
+static int spin_for_release(uint64_t mutex, uint32_t held) { (void)mutex; (void)held; return 0; }
+#endif
+
+/* svcArbitrateLock(owner handle, mutex address, own tag) */
+static uint32_t arbitrate_lock(uint32_t owner, uint64_t mutex, uint32_t tag) {
+    HosThread *self = hos_self();
+    if (spin_for_release(mutex, owner | HANDLE_WAIT_MASK)) return 0;
+    AcquireSRWLockExclusive(&klock);
+    if (word_get(mutex) != (owner | HANDLE_WAIT_MASK)) {   /* released meanwhile: let user mode retry */
+        ReleaseSRWLockExclusive(&klock);
+        return 0;
+    }
+    if (nwaiters == 1024) hos_fatal(NULL, "kernel: too many waiters");
+    waiters[nwaiters++] = (Waiter){self, mutex, 0, tag, 0};
+    ReleaseSRWLockExclusive(&klock);
+    int to;
+    hos_thread_wait(self, -1, &to);   /* woken once release_locked made us the owner */
+    return 0;
+}
+
+/* svcArbitrateUnlock(mutex address) */
+static uint32_t arbitrate_unlock(uint64_t mutex) {
+    AcquireSRWLockExclusive(&klock);
+    release_locked(mutex);
+    ReleaseSRWLockExclusive(&klock);
+    return 0;
+}
+
+/* svcWaitProcessWideKeyAtomic(mutex address, key address, own tag, timeout ns) */
+static uint32_t wait_key(uint64_t mutex, uint64_t key, uint32_t tag, int64_t timeout) {
+    HosThread *self = hos_self();
+    AcquireSRWLockExclusive(&klock);
+    /* The key says "a waiter" before the mutex is released (as Horizon's kernel does): user mode signals only when it
+       reads a nonzero key, so a signaller that took the mutex the moment it was free saw 0, skipped the signal, and
+       this thread slept forever (the rare stall while loading: a thread on a key of 1 with its mutex free). */
+    word_set(key, 1);
+    if (nwaiters == 1024) hos_fatal(NULL, "kernel: too many waiters");
+    waiters[nwaiters++] = (Waiter){self, mutex, key, tag, 1};
+    release_locked(mutex);
+    ReleaseSRWLockExclusive(&klock);
+    int to;
+    hos_thread_wait(self, timeout, &to);
+    if (!to) return 0;
+    AcquireSRWLockExclusive(&klock);
+    int i = find_thread(self);
+    if (i >= 0 && waiters[i].on_key) {   /* still waiting on the key: a real timeout; user mode relocks */
+        remove_waiter(i);
+        ReleaseSRWLockExclusive(&klock);
+        return R_TIMED_OUT;
+    }
+    ReleaseSRWLockExclusive(&klock);
+    /* signaled meanwhile: either moved to the mutex queue (wait for the hand-over) or already handed the mutex
+       (the wake is pending); both end with one wake-up */
+    hos_thread_wait(self, -1, &to);
+    return 0;
+}
+
+/* svcSignalProcessWideKey(key address, count): count <= 0 wakes all */
+static void signal_key(uint64_t key, int32_t count) {
+    AcquireSRWLockExclusive(&klock);
+    for (int n = 0; count <= 0 || n < count; n++) {
+        int others, i = best_waiter(key, 1, &others);
+        if (i < 0) break;
+        Waiter *w = &waiters[i];
+        /* The owner may unlock (owner -> 0) and other threads lock (0 -> them) in user mode meanwhile: a plain store
+           here once left the word naming a thread that had unlocked it (its next Lock aborted: "locked by the
+           current thread"), or gave a free mutex to two threads. */
+        for (;;) {
+            const uint32_t cur = word_get(w->mutex);
+            if (cur == 0) {                           /* mutex free: it is theirs */
+                if (!word_cas(w->mutex, 0, w->tag)) continue;
+                HosThread *t = w->t;
+                remove_waiter(i);
+                hos_thread_wake(t);
+            } else {                                  /* queue on the mutex */
+                if (!(cur & HANDLE_WAIT_MASK) && !word_cas(w->mutex, cur, cur | HANDLE_WAIT_MASK)) continue;
+                w->on_key = 0;
+            }
+            break;
+        }
+    }
+    int others;
+    if (best_waiter(key, 1, &others) < 0) word_set(key, 0);
+    ReleaseSRWLockExclusive(&klock);
+}
+
+/* Every thread waiting in the kernel's locks and condition variables, with the words they wait on (printed with the
+   thread stacks at HOS_EXIT_AFTER: who holds what in a hang). */
+void hos_kernel_dump(void) {
+    AcquireSRWLockExclusive(&klock);
+    hos_log("kernel: %d threads waiting", nwaiters);
+    for (int i = 0; i < nwaiters; i++) {
+        const Waiter *w = &waiters[i];
+        hos_log("kernel:   %s (tag %#x) on %s %#llx: mutex %#llx = %#x, key %#llx = %#x", hos_thread_name(w->t), w->tag,
+                w->on_key ? "key" : "mutex", (unsigned long long)(w->on_key ? w->key : w->mutex),
+                (unsigned long long)w->mutex, w->mutex ? word_get(w->mutex) : 0, (unsigned long long)w->key,
+                w->key ? word_get(w->key) : 0);
+    }
+    ReleaseSRWLockExclusive(&klock);
+    void hos_thread_log_handles(void);
+    hos_thread_log_handles();
+}
+
+/* svcQueryMemory: MemoryInfo { u64 addr, size; u32 state, attr, perm, ipc_refs, device_refs, pad } */
+extern const uint64_t hos_image_end;
+static void query_memory(uint64_t out, uint64_t addr) {
+    uint64_t base = 0, size = 0;
+    uint32_t state = 0, perm = 0;   /* Free */
+    uint64_t stack, stack_size;
+    hos_thread_stack(hos_self(), &stack, &stack_size);
+    if (addr >= stack && addr < stack + stack_size) { base = stack; size = stack_size; state = 0x0B; perm = 3; }   /* Stack */
+    else if (addr >= 0x08000000ULL && addr < hos_image_end) { base = 0x08000000ULL; size = hos_image_end - base; state = 0x03; perm = 5; }   /* Code */
+    else if (addr >= HOS_HEAP_BASE && addr < HOS_HEAP_BASE + hos_heap_size) { base = HOS_HEAP_BASE; size = hos_heap_size; state = 0x05; perm = 3; }   /* Normal */
+    else if (addr >= HOS_SYSTEM_BASE && addr < HOS_SYSTEM_END) { base = HOS_SYSTEM_BASE; size = HOS_SYSTEM_END - HOS_SYSTEM_BASE; state = 0x05; perm = 3; }
+    else { base = addr & ~0xFFFULL; size = 0x1000; }   /* Free: one page, enough for callers probing an address */
+    memset(GP(out), 0, 0x28);
+    G64(out) = base;
+    G64(out + 8) = size;
+    G32(out + 16) = state;
+    G32(out + 24) = perm;
+}
+
+/* A thread handle, with Horizon's pseudo-handle for the current thread. */
+#define CUR_THREAD 0xFFFF8000u
+static HosThread *thread_handle(uint32_t h) { return h == CUR_THREAD ? hos_self() : hos_thread_by_handle(h); }
+
+void a64_svc(Ctx *c, uint32_t imm) {
+    switch (imm) {
+    case 0x01:   /* SetHeapSize(-, size) -> (result, heap address) */
+        hos_heap_size = c->x[1];
+        c->x[0] = R_OK;
+        c->x[1] = HOS_HEAP_BASE;
+        return;
+    case 0x02:   /* SetMemoryPermission */
+    case 0x03:   /* SetMemoryAttribute */
+    case 0x16:   /* CloseHandle */
+    case 0x2A:   /* FlushEntireDataCache */
+    case 0x2B:   /* FlushDataCache */
+        c->x[0] = R_OK;
+        return;
+    case 0x0A:   /* ExitThread */
+        ExitThread(0);
+        return;
+    case 0x07:   /* ExitProcess */
+        hos_log("svcExitProcess");
+        hos_log_flush();
+        ExitProcess(0);
+        return;
+    case 0x0C: { /* GetThreadPriority(-, handle) -> (result, priority) */
+        HosThread *t = thread_handle((uint32_t)c->x[1]);
+        c->x[1] = t ? (uint32_t)hos_thread_prio(t) : 44;
+        c->x[0] = t ? R_OK : 0xE401;   /* svc::ResultInvalidHandle */
+        return;
+    }
+    case 0x0D: { /* SetThreadPriority(handle, priority) */
+        HosThread *t = thread_handle((uint32_t)c->x[0]);
+        if (t) hos_thread_priority(t, 1, (int)c->x[1]);
+        c->x[0] = t ? R_OK : 0xE401;
+        return;
+    }
+    case 0x0E: { /* GetThreadCoreMask(-, -, handle) -> (result, ideal core, affinity mask) */
+        HosThread *t = thread_handle((uint32_t)c->x[2]);
+        c->x[1] = t ? (uint32_t)hos_thread_core(t) : 0;
+        c->x[2] = t && hos_thread_mask(t) ? hos_thread_mask(t) : 0x7;
+        c->x[0] = t ? R_OK : 0xE401;
+        return;
+    }
+    case 0x0F: { /* SetThreadCoreMask(handle, ideal core, mask): -1 keeps the ideal core, -2/-3 defaults */
+        HosThread *t = thread_handle((uint32_t)c->x[0]);
+        if (t) hos_thread_affinity(t, (int)c->x[1], c->x[2]);
+        c->x[0] = t ? R_OK : 0xE401;
+        return;
+    }
+    case 0x24:   /* GetProcessId(-, handle) -> (result, id) */
+        c->x[1] = 0x51;
+        c->x[0] = R_OK;
+        return;
+    case 0x06:   /* QueryMemory(MemoryInfo* out, -, address) -> (result, page info) */
+        query_memory(c->x[0], c->x[2]);
+        c->x[0] = R_OK;
+        c->x[1] = 0;
+        return;
+    case 0x1A:   /* ArbitrateLock(owner handle, mutex, tag) */
+        c->x[0] = arbitrate_lock((uint32_t)c->x[0], c->x[1], (uint32_t)c->x[2]);
+        return;
+    case 0x1B:   /* ArbitrateUnlock(mutex) */
+        c->x[0] = arbitrate_unlock(c->x[0]);
+        return;
+    case 0x1C:   /* WaitProcessWideKeyAtomic(mutex, key, tag, timeout) */
+        c->x[0] = wait_key(c->x[0], c->x[1], (uint32_t)c->x[2], (int64_t)c->x[3]);
+        return;
+    case 0x1D:   /* SignalProcessWideKey(key, count) */
+        signal_key(c->x[0], (int32_t)c->x[1]);
+        return;
+    case 0x0B: { /* SleepThread(ns) */
+        void hos_sleep_logged(int64_t ns, uint64_t lr);
+        hos_sleep_logged((int64_t)c->x[0], c->x[30] | 1);
+        return;
+    }
+    case 0x10:   /* GetCurrentProcessorNumber */
+        c->x[0] = (uint32_t)hos_thread_core(hos_self());
+        return;
+    case 0x1E:   /* GetSystemTick */
+        c->x[0] = hos_ticks();
+        return;
+    case 0x25: { /* GetThreadId(-, handle) -> (result, id) */
+        HosThread *t = thread_handle((uint32_t)c->x[1]);
+        c->x[1] = hos_thread_id(t ? t : hos_self());
+        c->x[0] = R_OK;
+        return;
+    }
+    case 0x26: { /* Break(reason, info, size) */
+        hos_fatal(c, "svcBreak(reason %#llx, info %#llx, size %#llx)", (unsigned long long)c->x[0],
+                  (unsigned long long)c->x[1], (unsigned long long)c->x[2]);
+        return;
+    }
+    case 0x27: { /* OutputDebugString(str, size) */
+        uint64_t n = c->x[1] > 4096 ? 4096 : c->x[1];
+        char buf[4097];
+        memcpy(buf, GP(c->x[0]), n);
+        buf[n] = 0;
+        hos_log("debug: %s", buf);
+        c->x[0] = R_OK;
+        return;
+    }
+    case 0x29: { /* GetInfo(id0, handle, id1) -> (result, value) */
+        int ok;
+        uint64_t v = get_info((uint32_t)c->x[1], c->x[3], &ok);
+        if (!ok) hos_log("svcGetInfo: unknown id %#x/%#llx (lr %#llx)", (uint32_t)c->x[1],
+                         (unsigned long long)c->x[3], (unsigned long long)c->x[30]);
+        c->x[1] = v;
+        c->x[0] = ok ? R_OK : R_INVALID_ENUM;
+        return;
+    }
+    default:
+        hos_fatal(c, "svc %#x not implemented (x0 %#llx x1 %#llx x2 %#llx)", imm, (unsigned long long)c->x[0],
+                  (unsigned long long)c->x[1], (unsigned long long)c->x[2]);
+    }
+}
