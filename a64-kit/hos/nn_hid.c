@@ -1,12 +1,14 @@
 /* nn::hid: one Pro Controller (FullKey style) on Npad No.1, from every XInput gamepad and the keyboard and mouse at
    once. Buttons map by position (the Xbox bottom face button is the Switch's bottom one, B).
 
-   Keyboard: WASD left stick, IJKL right stick (camera), Space X (jump), E A (action), Shift/Q B (run/cancel),
-   F Y (attack), R R, Z L, C ZL, V ZR, Ctrl left-stick click (crouch), Enter Plus, Tab Minus, arrows d-pad. Only
+   Keyboard (totk-pc-recomp's layout): WASD left stick, arrows or IJKL right stick (camera), Space X (jump), E A
+   (action), Shift B (run/cancel), Q L (abilities), R R, Z ZL, X or F ZR (bow), Ctrl left-stick click (crouch), C
+   right-stick click (first person), Tab or Enter Plus, M Minus (map), 1 2 3 4 d-pad left, up, right, down. Only
    while the game's window is in front (the key state is global).
-   Mouse (after a click in the window, display.c; Esc releases): its motion is the right stick, deflection by speed.
-   - and = change its sensitivity (x0.8 / x1.25, shown in the title bar, kept in <user>/mouse_sens.txt);
-   HOS_MOUSE_SENS=<x> sets it, HOS_MOUSE_INVERT_Y=1 flips up/down.
+   Mouse (after a click in the window, display.c; Esc releases): its motion is the right stick (mouse panning,
+   mouse_stick), left button Y (attack), right button ZL (shield, lock on). - and = change its sensitivity (x0.8 /
+   x1.25, shown in the title bar, kept in <user>/mouse_sens.txt); HOS_MOUSE_SENS=<x> sets it, HOS_MOUSE_INVERT_Y=1
+   flips up/down.
 
    HOS_INPUT_SCRIPT (test runs): timed presses added to the input, "<seconds>:<button>[+<button>...][/<ms held>],..."
    with buttons A B X Y L R ZL ZR PLUS MINUS LS RS LEFT UP RIGHT DOWN and the stick directions LUP LDOWN LLEFT
@@ -15,6 +17,7 @@
    Npad states share one layout (NpadCommonState): { s64 sampling; u64 buttons; s32 lx, ly; s32 rx, ry; u32 attributes;
    pad } = 0x28 bytes. */
 #include "hos.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,9 +39,7 @@ static int key(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
 int hos_mouse_take(int32_t *dx, int32_t *dy);   /* display.c */
 
-/* The captured mouse as right-stick deflection: motion over the last >= 8 ms as a speed (the game reads the pad
-   several times a frame: those reads see one value), smoothed a little; at sensitivity 1 full deflection at 1000
-   counts/s. The smallest motions start past the game's dead zone. */
+/* The captured mouse's sensitivity (mouse_stick below): - and = change it, kept in <user>/mouse_sens.txt */
 double hos_mouse_sens = 0;   /* (display.c shows it in the title) */
 extern const char *hos_user_dir;
 
@@ -60,9 +61,51 @@ static void mouse_sens_keys(void) {
     prev_plus = plus;
 }
 
+/* The mouse as the right stick, "mouse panning" as MacNativeGames does it (games/totk/runtime/mouse_look.h,
+   github.com/ly05010419/MacNativeGames, MIT; the idea is yuzu's): every movement adds to a held deflection, and a
+   tick every 10 ms shows it to the game and then lets it decay. The camera keeps turning while the mouse moves and
+   settles smoothly when it stops, whatever the mouse's report rate, the game's frame rate or how often it reads the
+   pad (the old speed-per-8-ms stick jumped between reads). The decay grows with the deflection (1 - length^2 *
+   decay), at least min_decay a tick; the held length is cut to 1.5 (past the stick's edge, so a steady turn is easy
+   to hold) and shown at most 1. A movement that leaves less than 20% is lifted to 20%, past the game's dead zone.
+   MacNativeGames' decay (18%, at least 6%) suits a trackpad: with a mouse the camera drifted on for 0.4 s after it
+   stopped. Here 30%, at least 20% (HOS_MOUSE_DECAY / HOS_MOUSE_MIN_DECAY, percent): it stops within ~0.1 s, and one
+   raw count moves the stick by sensitivity * 0.03, so at 1 the deflection follows 100-700 counts/s (0.2 to ~0.9)
+   and is full from ~1000. */
+enum { MOUSE_TICK_NS = 10000000 };
+static double look_x, look_y;   /* (the held deflection, stick units, y up) */
+
+static double mouse_percent(const char *name, double fallback) {
+    const char *e = getenv(name);
+    return e && atof(e) >= 0 && atof(e) <= 100 ? atof(e) / 100 : fallback;
+}
+
+static void mouse_look_move(double dx, double dy) {
+    const double k = hos_mouse_sens * 0.03;
+    look_x += dx * k;
+    look_y += dy * k;
+    const double length = sqrt(look_x * look_x + look_y * look_y), least = 0.2;
+    if (length > 0 && length < least) look_x *= least / length, look_y *= least / length;
+}
+
+static void mouse_look_tick(void) {
+    static double decay_rate = -1, min_decay;
+    if (decay_rate < 0) {
+        decay_rate = mouse_percent("HOS_MOUSE_DECAY", 0.30);
+        min_decay = mouse_percent("HOS_MOUSE_MIN_DECAY", 0.20);
+    }
+    double length = sqrt(look_x * look_x + look_y * look_y);
+    if (length > 1.5) look_x *= 1.5 / length, look_y *= 1.5 / length, length = 1.5;
+    const double c = length < 1 ? length : 1, decay = 1 - c * c * decay_rate, most = 1 - min_decay;
+    const double keep = decay < most ? (decay > 0 ? decay : 0) : most;
+    look_x *= keep;
+    look_y *= keep;
+    if (fabs(look_x) < 1e-6 && fabs(look_y) < 1e-6) look_x = look_y = 0;
+}
+
 static int mouse_stick(int32_t *rx, int32_t *ry) {
-    static int64_t last;
-    static double vx, vy;
+    static int64_t next_tick;
+    static int32_t shown[2];
     static int captured;
     static int invert = -1;
     if (invert < 0) {
@@ -80,28 +123,26 @@ static int mouse_stick(int32_t *rx, int32_t *ry) {
         if (e && atof(e) > 0) hos_mouse_sens = atof(e);
     }
     mouse_sens_keys();
-    const double scale = hos_mouse_sens / 1000.0;
     const int64_t now = hos_now_ns();
-    if (!last) last = now;
-    if (now - last >= 8000000) {
+    if (now >= next_tick) {
         int32_t dx, dy;
         captured = hos_mouse_take(&dx, &dy);
-        double dt = (now - last) / 1e9;
-        if (dt > 0.1) dt = 0.1;
-        last = now;
-        const double tx = dx / dt * scale, ty = (invert ? dy : -dy) / dt * scale;
-        vx = captured ? vx * 0.2 + tx * 0.8 : 0;
-        vy = captured ? vy * 0.2 + ty * 0.8 : 0;
+        if (!captured) look_x = look_y = 0;
+        else if (dx || dy) mouse_look_move(dx, invert ? dy : -dy);
+        /* (the ticks since the last read: the first shows the deflection, the rest only decay it; at most 10, a
+           read after a pause starts afresh) */
+        const int64_t ticks = next_tick ? (now - next_tick) / MOUSE_TICK_NS + 1 : 1;
+        double ox = look_x, oy = look_y;
+        const double shown_length = sqrt(ox * ox + oy * oy);
+        if (shown_length > 1) ox /= shown_length, oy /= shown_length;
+        shown[0] = (int32_t)lround(ox * 32767);
+        shown[1] = (int32_t)lround(oy * 32767);
+        for (int64_t i = 0; i < (ticks < 10 ? ticks : 10); i++) mouse_look_tick();
+        next_tick = (next_tick && ticks <= 10 ? next_tick + ticks * MOUSE_TICK_NS : now + MOUSE_TICK_NS);
     }
     if (!captured) return 0;
-    const double v[2] = {vx, vy};
-    int32_t *out[2] = {rx, ry};
-    for (int i = 0; i < 2; i++) {
-        double a = v[i] < 0 ? -v[i] : v[i];
-        if (a < 0.002) { *out[i] = 0; continue; }
-        a = 0.2 + 0.8 * (a > 1 ? 1 : a);
-        *out[i] = (int32_t)((v[i] < 0 ? -a : a) * 32767);
-    }
+    *rx = shown[0];
+    *ry = shown[1];
     return 1;
 }
 
@@ -336,16 +377,31 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
        used to follow the player's pad (and pressed things in its own menus). */
     if ((npresses > 0 && (hos_now_ns() - script_t0) / 1000000 < script_end_ms + 5000) || !game_in_front()) return;
     pads_read(buttons, stick);
+    /* (the keys of totk-pc-recomp's docs/controls.md, github.com/valentderah/totk-pc-recomp, MIT; plus Enter for
+       Plus and IJKL as another camera) */
     struct { int vk; int b; } kmap[] = {
-        {VK_SPACE, B_X}, {'E', B_A}, {VK_SHIFT, B_B}, {'Q', B_B}, {'F', B_Y}, {'R', B_R}, {'Z', B_L}, {'C', B_ZL},
-        {'V', B_ZR}, {VK_CONTROL, B_LS}, {VK_RETURN, B_PLUS}, {VK_TAB, B_MINUS}, {VK_LEFT, B_LEFT}, {VK_UP, B_UP},
-        {VK_RIGHT, B_RIGHT}, {VK_DOWN, B_DOWN}};
+        {VK_SPACE, B_X}, {'E', B_A}, {VK_SHIFT, B_B}, {'Q', B_L}, {'R', B_R}, {'Z', B_ZL}, {'X', B_ZR}, {'F', B_ZR},
+        {VK_CONTROL, B_LS}, {'C', B_RS}, {VK_TAB, B_PLUS}, {VK_RETURN, B_PLUS}, {'M', B_MINUS}, {'1', B_LEFT},
+        {'2', B_UP}, {'3', B_RIGHT}, {'4', B_DOWN}};
     for (unsigned i = 0; i < sizeof kmap / sizeof *kmap; i++)
         if (key(kmap[i].vk)) *buttons |= 1ULL << kmap[i].b;
     int32_t mouse[4] = {0};
-    if (mouse_stick(&mouse[2], &mouse[3])) stick_max(stick, mouse);
-    const int32_t keys[4] = {(key('D') - key('A')) * 32767, (key('W') - key('S')) * 32767,
-                             (key('L') - key('J')) * 32767, (key('I') - key('K')) * 32767};
+    /* left button Y (attack), right button ZL (shield, lock on), while the mouse is captured; a button held when
+       the capture began counts only after it was let go (the click that captures never reaches the game) */
+    static int armed[2];
+    if (mouse_stick(&mouse[2], &mouse[3])) {
+        stick_max(stick, mouse);
+        const int vk[2] = {VK_LBUTTON, VK_RBUTTON}, b[2] = {B_Y, B_ZL};
+        for (int i = 0; i < 2; i++) {
+            if (!key(vk[i])) armed[i] = 1;
+            else if (armed[i]) *buttons |= 1ULL << b[i];
+        }
+    } else {
+        armed[0] = armed[1] = 0;
+    }
+    const int cx = (key(VK_RIGHT) || key('L')) - (key(VK_LEFT) || key('J')),
+              cy = (key(VK_UP) || key('I')) - (key(VK_DOWN) || key('K'));
+    const int32_t keys[4] = {(key('D') - key('A')) * 32767, (key('W') - key('S')) * 32767, cx * 32767, cy * 32767};
     stick_max(stick, keys);
 }
 

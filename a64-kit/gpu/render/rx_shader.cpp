@@ -1092,6 +1092,7 @@ public:
         }
         is_proprietary_driver = true;
     }
+    uint64_t key() const { return nvn.key; }
     u64 ReadInstruction(u32 address) override {
         if (address / 8 < nvn.code.size()) return nvn.code[address / 8];
         return gpu_get<uint64_t>(nvn.data + address);
@@ -1167,6 +1168,13 @@ std::unique_ptr<Translated> nvn_translate(NvnEnvironment& env, bool graphics) {
     host.support_int64 = false;
     host.min_ssbo_alignment = dev.limits.minStorageBufferOffsetAlignment;
     t->program = Shader::Maxwell::TranslateProgram(t->insts, t->blocks, env, cfg, host);
+    // RX_WARP_LOG=1: programs using the warp's lane id, shuffles, votes or lane masks (the WGSL backend has no warps)
+    static const bool warp_log = env_flag("RX_WARP_LOG");
+    if (const auto& i = t->program.info; warp_log && (i.uses_subgroup_invocation_id || i.uses_subgroup_shuffles ||
+                                                       i.uses_subgroup_vote || i.uses_subgroup_mask))
+        hos_log("rx: %s program %016llx uses the warp: lane id %d shuffles %d vote %d masks %d",
+                graphics ? "graphics" : "compute", (unsigned long long)env.key(), i.uses_subgroup_invocation_id,
+                i.uses_subgroup_shuffles, i.uses_subgroup_vote, i.uses_subgroup_mask);
     return t;
 }
 
