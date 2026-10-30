@@ -3,8 +3,8 @@
 #include "hos.h"
 #include <stdio.h>
 #include <time.h>
-#ifdef __EMSCRIPTEN__
-#include <windows.h>   /* (the browser build: the Microsoft C runtime's time functions) */
+#if !defined(_WIN32)
+#include <windows.h>   /* localtime_s, gmtime_s, _mkgmtime: the shim, not the system time.h */
 #endif
 
 static int64_t boot_ns;

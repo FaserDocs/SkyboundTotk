@@ -508,15 +508,24 @@ def cmd_native(a):
     # scan is ~0.08 ms now). RX_SOFT_WRITE_WATCH=0: Windows' write watch, as before 2026-10-20.
     soft_watch = [] if os.environ.get("RX_SOFT_WRITE_WATCH") == "0" else ["-DA64_WRITE_TRACK"]
     base += soft_watch
+    linux = toolchain.is_linux()
+    linux_hos = os.path.join(HOS, "linux")
+    if linux:
+        base = ["-I" + linux_hos, "-I" + HOS] + base + subprocess.check_output(
+            ["pkg-config", "--cflags", "sdl3", "libavformat", "libavcodec", "libavutil", "libswscale"],
+            text=True).split()
     jobs = []
     lifted = sorted(os.path.join(gen, f) for f in os.listdir(gen) if f.endswith(".c"))
+    linux_skip = {"hos_prof.c", "movie_mf.c", "display.c", "pad_sdl.c"} if linux else set()
     runtime = [os.path.join(RT, f) for f in os.listdir(RT) if f.endswith(".c")] + \
-              [os.path.join(HOS, f) for f in os.listdir(HOS) if f.endswith(".c")]
+              [os.path.join(HOS, f) for f in os.listdir(HOS) if f.endswith(".c") and f not in linux_skip]
+    if linux:
+        runtime += [os.path.join(linux_hos, f) for f in sorted(os.listdir(linux_hos)) if f.endswith(".c")]
     # lifted chunks include only rt/ and generated headers; the OS layer also includes hos/*.h and the renderer's API
     apply_entry_hooks(gen, img_dir)
     apply_splices(gen)
     deps_lifted = headers_key(RT, gen)
-    deps_runtime = headers_key(RT, HOS, gen, os.path.join(GPU, "render"))
+    deps_runtime = headers_key(RT, HOS, gen, os.path.join(GPU, "render"), *([linux_hos] if linux else []))
     # the renderer: WebGPU through wgpu-native (a release of github.com/gfx-rs/wgpu-native: include/, lib/)
     wgpu = a.wgpu or os.environ.get("WGPU_NATIVE")
     if wgpu and not os.path.isfile(os.path.join(wgpu, "include", "webgpu", "webgpu.h")):
@@ -561,6 +570,8 @@ def cmd_native(a):
                                               "-I" + os.path.join(GPU, "compat"),
                                               "-I" + os.path.join(GPU, "third_party", "suyu"),
                                               "-I" + os.path.join(wgpu, "include")]
+        if linux:
+            gflags = ["-I" + linux_hos] + gflags
         gdeps = tree_headers_key(GPU) + hashlib.sha1(open(os.path.join(wgpu, "include", "webgpu", "webgpu.h"),
                                                           "rb").read()).hexdigest()
         for src in gpu_sources():
@@ -578,17 +589,26 @@ def cmd_native(a):
                 print("[%d/%d] %s %.0fs" % (i, len(jobs), os.path.basename(src), dt), flush=True)
     if failed:
         sys.exit("%d files failed to compile" % failed)
-    exe = os.path.join(nat, (a.output or a.name) + ".exe")
+    exe = os.path.join(nat, (a.output or a.name) + ("" if linux else ".exe"))
     objs = [j[2] for j in jobs]
     rsp = os.path.join(nat, "link.rsp")
     open(rsp, "w").write("\n".join('"%s"' % o.replace("\\", "/") for o in objs))
-    libs = ["-luser32", "-lkernel32", "-ldbghelp", "-lwinmm", "-lgdi32", "-lole32", "-lmfplat", "-lmfreadwrite", "-lshell32",
-            "-lmfuuid"] if os.name == "nt" else []
-    if wgpu:
-        libs.append(os.path.join(wgpu, "lib", "wgpu_native.dll.lib"))
-        dll, dst = os.path.join(wgpu, "lib", "wgpu_native.dll"), os.path.join(nat, "wgpu_native.dll")
-        if not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(dll):   # (in use while the game runs)
-            shutil.copyfile(dll, dst)
+    if linux:
+        libs = ["-lpthread", "-ldl", "-lm", "-lstdc++"] + subprocess.check_output(
+            ["pkg-config", "--libs", "sdl3", "libavformat", "libavcodec", "libavutil", "libswscale"], text=True).split()
+        if wgpu:
+            libs += ["-L" + os.path.join(wgpu, "lib"), "-lwgpu_native", "-Wl,-rpath,$ORIGIN"]
+            so, dst = os.path.join(wgpu, "lib", "libwgpu_native.so"), os.path.join(nat, "libwgpu_native.so")
+            if os.path.isfile(so) and (not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(so)):
+                shutil.copyfile(so, dst)
+    else:
+        libs = ["-luser32", "-lkernel32", "-ldbghelp", "-lwinmm", "-lgdi32", "-lole32", "-lmfplat", "-lmfreadwrite", "-lshell32",
+                "-lmfuuid"] if os.name == "nt" else []
+        if wgpu:
+            libs.append(os.path.join(wgpu, "lib", "wgpu_native.dll.lib"))
+            dll, dst = os.path.join(wgpu, "lib", "wgpu_native.dll"), os.path.join(nat, "wgpu_native.dll")
+            if not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(dll):   # (in use while the game runs)
+                shutil.copyfile(dll, dst)
     # SDL2 (zlib license, third_party/sdl2): game controllers beyond XInput (DualSense, DualShock 4, Switch Pro...),
     # loaded at run time by hos/pad_sdl.c; the game runs without it (XInput, keyboard and mouse only)
     sdl = os.path.join(HERE, "..", "third_party", "sdl2", "SDL2.dll")
@@ -606,18 +626,31 @@ def cmd_native(a):
         order = port_order if os.path.isfile(port_order) else None
     if order == "none":
         order = None
-    order_flags = ["-Wl,/ORDER:@" + os.path.abspath(order).replace("\\", "/"), "-Wl,/IGNORE:4037"] if order else []
-    if lifted_lto:   # (the lifted code's optimization runs at the link now: its LoopRotate cap too; a cache for relinks)
-        order_flags += ["-Wl,/mllvm:-rotation-max-header-size=0", "-Wl,/opt:lldltojobs=8",   # (~3 GB a big module)
-                        "-Wl,/lldltocache:" + os.path.join(nat, "ltocache").replace("\\", "/")]
-        if a.opt == "O3":   # (the link's optimization of the lifted code at that level too)
-            order_flags.append("-Wl,/opt:lldlto=3")
-        if capture_flag:
-            order_flags.append("-Wl,/mllvm:" + capture_flag)
-        # RX_LTO_LINK_FLAGS="<flags>" (experiments): more link flags, e.g. -Wl,/mllvm:-import-instr-limit=200
-        order_flags += os.environ.get("RX_LTO_LINK_FLAGS", "").split()
+    if linux:
+        order_flags = ["-Wl,--symbol-ordering-file," + os.path.abspath(order), "-Wl,--no-warn-symbol-ordering"] if order else []
+        if lifted_lto:
+            order_flags += ["-Wl,-mllvm,-rotation-max-header-size=0", "-Wl,--thinlto-jobs=4",
+                            "-Wl,--thinlto-cache-dir=" + os.path.join(nat, "ltocache")]
+            if a.opt == "O3":
+                order_flags.append("-Wl,--lto-O3")
+            if capture_flag:
+                order_flags.append("-Wl,-mllvm," + capture_flag)
+            order_flags += os.environ.get("RX_LTO_LINK_FLAGS", "").split()
+        link_tail = ["-no-pie"] + order_flags + libs
+    else:
+        order_flags = ["-Wl,/ORDER:@" + os.path.abspath(order).replace("\\", "/"), "-Wl,/IGNORE:4037"] if order else []
+        if lifted_lto:   # (the lifted code's optimization runs at the link now: its LoopRotate cap too; a cache for relinks)
+            order_flags += ["-Wl,/mllvm:-rotation-max-header-size=0", "-Wl,/opt:lldltojobs=8",   # (~3 GB a big module)
+                            "-Wl,/lldltocache:" + os.path.join(nat, "ltocache").replace("\\", "/")]
+            if a.opt == "O3":   # (the link's optimization of the lifted code at that level too)
+                order_flags.append("-Wl,/opt:lldlto=3")
+            if capture_flag:
+                order_flags.append("-Wl,/mllvm:" + capture_flag)
+            # RX_LTO_LINK_FLAGS="<flags>" (experiments): more link flags, e.g. -Wl,/mllvm:-import-instr-limit=200
+            order_flags += os.environ.get("RX_LTO_LINK_FLAGS", "").split()
+        link_tail = ["-Wl,/STACK:268435456", "-Wl,/SUBSYSTEM:CONSOLE"] + order_flags + libs
     subprocess.run([cc] + toolchain.native_target() + toolchain.native_link() +
-                   ["-g", "-o", exe, "@" + rsp, "-Wl,/STACK:268435456", "-Wl,/SUBSYSTEM:CONSOLE"] + order_flags + libs,
+                   ["-g", "-o", exe, "@" + rsp] + link_tail,
                    check=True)
     print("linked %s (%.0f MB) in %.0fs" % (exe, os.path.getsize(exe) / 2 ** 20, time.time() - t0))
 
@@ -741,7 +774,7 @@ def cmd_stubs(a):
 
 def cmd_run(a):
     root, img_dir, gen, nat = dirs(a)
-    exe = os.path.join(nat, a.name + ".exe")
+    exe = os.path.join(nat, a.name + ("" if toolchain.is_linux() else ".exe"))
     args = [exe, os.path.join(img_dir, "image.bin"), "--user", os.path.join(root, "user")]
     if a.romfs:
         args += ["--romfs", a.romfs]

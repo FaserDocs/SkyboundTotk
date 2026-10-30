@@ -7,7 +7,7 @@ Rexcomp and the AArch64 kit are by NotRexed. This repository includes:
 | suyu's AArch64 -> C translator (`arm64_to_c.h`, unmodified), from the mk8-recomp fork of suyu (`dougchansan/suyu-v0.0.4`, branch `mk8-recomp`, commit `89c5e72412b28c788557991a86f471ea3332f62a`) | `a64-kit/lift/suyu/` | GPL-2.0-or-later (texts next to it) |
 | suyu / yuzu shader recompiler, common and video_core parts, with Rexcomp's WGSL backend and changes | `a64-kit/gpu/third_party/suyu/` | GPL-2.0-or-later and GPL-3.0-or-later per file (SPDX headers; texts next to it) |
 | Small stand-ins for boost, fmt and ankerl::unordered_dense headers | `a64-kit/gpu/compat/` | see each file |
-| wgpu-native v29.0.1.1, Windows x64 release | `third_party/wgpu-native/` | MIT or Apache-2.0 (`LICENSE.md` there) |
+| wgpu-native v29.0.1.1, Windows x64 release. Linux builds `libwgpu_native.so` from that tag plus `third_party/wgpu-native/totk-patches/` (wgpu v29.0.3); the shared library is not committed | `third_party/wgpu-native/` | MIT or Apache-2.0 (`LICENSE.md` there) |
 | SDL2 2.32.10 Windows x64 runtime | `third_party/sdl2/` | zlib (`LICENSE.txt` there) |
 | NVN API types reconstructed from Darksiders II debug information by h1k421 (as adapted for TOTK by jhaizhou) | `a64-kit/gpu/render/nvn_api.h` | MIT (text in the file) |
 | The native NVN layer's design, object layouts, command records and TOTK findings, after the NVN layer of d2r-mobile / MacNativeGames by jhaizhou (github.com/jhaizhou-ops/d2r-mobile, github.com/ly05010419/MacNativeGames) | `a64-kit/hos/nvn_native.c`, `a64-kit/gpu/render/rx_nvn.*` | MIT |

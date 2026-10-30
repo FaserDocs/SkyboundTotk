@@ -12,12 +12,17 @@
 #include "hos.h"
 #include <stdio.h>
 #include <stdlib.h>
-#if defined(_WIN32) || defined(__EMSCRIPTEN__)
+#if defined(_WIN32) || defined(__EMSCRIPTEN__) || defined(__linux__)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <mmsystem.h>
-#else
+#endif
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+#include <errno.h>
+#include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
+#define _ftelli64 ftello
 #endif
 
 #ifdef A64_MEM_ZERO
@@ -58,6 +63,20 @@ static int standalone_paths(void) {
     return snprintf(standalone_image, sizeof standalone_image, "%s\\image.bin", exe) < (int)sizeof standalone_image &&
            snprintf(standalone_romfs, sizeof standalone_romfs, "%s\\romfs", exe) < (int)sizeof standalone_romfs &&
            snprintf(standalone_user, sizeof standalone_user, "%s\\user", exe) < (int)sizeof standalone_user;
+}
+#elif !defined(__EMSCRIPTEN__)
+static char standalone_image[32768], standalone_romfs[32768], standalone_user[32768];
+static int standalone_paths(void) {
+    char exe[32768];
+    const ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n <= 0) return 0;
+    exe[n] = 0;
+    char *slash = strrchr(exe, '/');
+    if (!slash) return 0;
+    *slash = 0;
+    return snprintf(standalone_image, sizeof standalone_image, "%s/image.bin", exe) < (int)sizeof standalone_image &&
+           snprintf(standalone_romfs, sizeof standalone_romfs, "%s/romfs", exe) < (int)sizeof standalone_romfs &&
+           snprintf(standalone_user, sizeof standalone_user, "%s/user", exe) < (int)sizeof standalone_user;
 }
 #endif
 
@@ -124,8 +143,14 @@ static int reserve_guest(void) {
     return VirtualAlloc((void *)A64_HOST_BASE, GUEST_SPACE, MEM_RESERVE | MEM_COMMIT | watch,
                         PAGE_READWRITE) == (void *)A64_HOST_BASE;
 #else
-    return mmap((void *)A64_HOST_BASE, GUEST_SPACE, PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE, -1, 0) == (void *)A64_HOST_BASE;
+    void *p = mmap((void *)A64_HOST_BASE, GUEST_SPACE, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE, -1, 0);
+    if (p != (void *)A64_HOST_BASE) {
+        fprintf(stderr, "mmap guest window at %#llx failed: %s\n", (unsigned long long)A64_HOST_BASE, strerror(errno));
+        return 0;
+    }
+    if (getenv("HOS_LARGE_PAGES")) madvise(p, GUEST_SPACE, MADV_HUGEPAGE);
+    return 1;
 #endif
 }
 
@@ -145,6 +170,8 @@ static void call_guest_args(Ctx *c, uint64_t addr, uint64_t sp, const char *what
     hos_mem_checkpoint(what);
     f(c);
 }
+static void run_guest(void);
+
 static void call_guest(Ctx *c, uint64_t addr, uint64_t sp, const char *what) {
     c->x[0] = c->x[1] = 0;
     call_guest_args(c, addr, sp, what);
@@ -158,7 +185,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--trace")) hos_trace = 1;
         else if (!image) image = argv[i];
     }
-#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+#if !defined(__EMSCRIPTEN__)
     if (!standalone_paths()) {
         fprintf(stderr, "cannot determine the executable's folder\n");
         return 1;
@@ -219,6 +246,17 @@ int main(int argc, char **argv) {
     void hos_mods_init(const char *image_path);
     hos_mods_init(image);   /* mods.c: <exe folder>\mods (RomFS files, exefs data patches) */
 
+#if defined(__linux__)
+    void linux_display_enter(void (*boot)(void));
+    linux_display_enter(run_guest);
+    return 0;
+#else
+    run_guest();
+    return 0;
+#endif
+}
+
+static void run_guest(void) {
     Ctx *c = hos_boot_main_thread(hos_main_stack_size);
     uint64_t sp = c->x[31];
     void hos_prof_start(void);
@@ -249,5 +287,4 @@ int main(int argc, char **argv) {
     }
     call_guest(c, hos_entry_nnMain, sp, "nnMain");
     hos_log("nnMain returned");
-    return 0;
 }
