@@ -415,6 +415,23 @@ std::string EntryPoint(const EmitContext& ctx, const IR::Program& program, const
             }
         }
         out += "  return output;\n}\n";
+        if (ctx.vs_compute) {   // (vs_as_compute_next: the same body as a compute entry, outputs dropped)
+            const auto swap = [&out](std::string_view from, std::string_view to) {
+                const size_t at{out.find(from)};
+                if (at == std::string::npos) throw NotImplementedException("vertex program as compute: {}", from);
+                out.replace(at, from.size(), to);
+            };
+            if (out.find("@location(", 0) < out.find("};\nstruct VsOut")) {
+                throw NotImplementedException("vertex program as compute: attributes not pulled");
+            }
+            swap("struct VsIn {\n  @builtin(vertex_index) vertex_index: u32,\n"
+                 "  @builtin(instance_index) instance_index: u32,\n",
+                 "struct VsIn {\n  vertex_index: u32,\n  instance_index: u32,\n");
+            swap("@vertex\nfn main(input: VsIn) -> VsOut {\n",
+                 "@compute @workgroup_size(1)\nfn main(@builtin(global_invocation_id) gid_: vec3<u32>) {\n"
+                 "  let input = VsIn(gid_.x, gid_.y);\n");
+            swap("  return output;\n}\n", "}\n");
+        }
         break;
     }
     case Stage::Fragment: {

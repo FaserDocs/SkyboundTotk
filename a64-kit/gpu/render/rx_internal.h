@@ -361,7 +361,7 @@ struct Device {
     WGPUDevice device = nullptr;
     WGPUQueue queue = nullptr;
     WGPULimits limits{};
-    bool bc = false, float32_filterable = false, depth32_stencil8 = false, norm16 = false, depth_clip_control = false,
+    bool bc = false, float32_filterable = false, float32_blendable = false, depth32_stencil8 = false, norm16 = false, depth_clip_control = false,
          early_depth_test = false, timestamps = false;
     std::string description;
 };
@@ -442,6 +442,11 @@ struct ProgramPair {
     ShaderModule vs, fs;
     bool has_fs = false;
     bool failed = false;
+    /// A vertex program that stores to memory, as a compute program (WebGPU's vertex stage cannot store): run before
+    /// the draw (nvn_vs_compute, rx_draw.cpp). Empty when the vertex program stores nothing.
+    std::string vs_compute_wgsl;
+    WGPUShaderModule vs_compute_module = nullptr;
+    bool vs_compute_failed = false;
 };
 ProgramPair* programs_for_draw(Channel& ch, const Regs& regs);
 /// Vertex attributes the vertex stage reads from memory itself (layouts WebGPU's vertex fetch cannot describe):

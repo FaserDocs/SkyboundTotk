@@ -94,7 +94,7 @@ These are reports and investigation notes, not a complete compatibility list. So
 | Stretched terrain | **Reported** | Terrain can appear randomly stretched; cause and reproducibility need investigation. |
 | Incorrect terrain textures | **Reported** | Some areas have wrong terrain textures; locations and causes need investigation. |
 | Weapon and shield wheel background | **Fixed** | The d-pad quick menus opened over a black background; they now take the ability wheel's 1/30 s step while held (PR #11). |
-| Ultrahand cannot grab | **Reproduced; open** | Aiming Ultrahand at an object outlines it orange and shows "A Grab", but it never turns green and A does not pick it up (issue #9). Reproduced on both GPU paths; the cause is being investigated. |
+| Ultrahand cannot grab | **Fixed** | Aimed objects stayed orange and A missed (issue #9). The game reads the object under the reticle from a GPU pass whose vertex shader stores the result, which WebGPU vertex shaders cannot do; that shader now also runs as a compute shader, and the 16-bit object-id target is kept exact. Objects turn green and A lifts them. |
 | Ultrawide | **Unresolved** | F6 has been reported to stretch the image instead of providing a correctly proportioned wider view. The exact failure is unknown. |
 | Zonai Portable Pot particles | **Workaround; retest** | A workaround greatly reduced disappearing-effect spikes in an earlier build, but short stray lines remained and the underlying cause is unknown. Retest in Skybound. |
 | Depths gloom | **Earlier fix; retest** | Missing or incorrect ground gloom was reported on the path to Ganon. Earlier notes record a fix for a reproduced case; standalone Skybound and other locations need verification. |

@@ -152,7 +152,7 @@ void EmitLoadStorage128(EmitContext& ctx, IR::Inst& inst, const IR::Value& bindi
 
 void EmitWriteStorageU8(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                         std::string_view value) {
-    if (ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) {
+    if ((ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) && !ctx.vs_compute) {
         return;   // WebGPU has no writable storage in vertex shaders
     }
     const auto offset_var{ctx.var_alloc.Consume(offset)};
@@ -162,7 +162,7 @@ void EmitWriteStorageU8(EmitContext& ctx, const IR::Value& binding, const IR::Va
 
 void EmitWriteStorageS8(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                         std::string_view value) {
-    if (ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) {
+    if ((ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) && !ctx.vs_compute) {
         return;   // WebGPU has no writable storage in vertex shaders
     }
     const auto offset_var{ctx.var_alloc.Consume(offset)};
@@ -172,7 +172,7 @@ void EmitWriteStorageS8(EmitContext& ctx, const IR::Value& binding, const IR::Va
 
 void EmitWriteStorageU16(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                          std::string_view value) {
-    if (ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) {
+    if ((ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) && !ctx.vs_compute) {
         return;   // WebGPU has no writable storage in vertex shaders
     }
     const auto offset_var{ctx.var_alloc.Consume(offset)};
@@ -182,7 +182,7 @@ void EmitWriteStorageU16(EmitContext& ctx, const IR::Value& binding, const IR::V
 
 void EmitWriteStorageS16(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                          std::string_view value) {
-    if (ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) {
+    if ((ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) && !ctx.vs_compute) {
         return;   // WebGPU has no writable storage in vertex shaders
     }
     const auto offset_var{ctx.var_alloc.Consume(offset)};
@@ -192,7 +192,7 @@ void EmitWriteStorageS16(EmitContext& ctx, const IR::Value& binding, const IR::V
 
 void EmitWriteStorage32(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                         std::string_view value) {
-    if (ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) {
+    if ((ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) && !ctx.vs_compute) {
         return;   // WebGPU has no writable storage in vertex shaders
     }
     const auto offset_var{ctx.var_alloc.Consume(offset)};
@@ -201,7 +201,7 @@ void EmitWriteStorage32(EmitContext& ctx, const IR::Value& binding, const IR::Va
 
 void EmitWriteStorage64(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                         std::string_view value) {
-    if (ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) {
+    if ((ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) && !ctx.vs_compute) {
         return;   // WebGPU has no writable storage in vertex shaders
     }
     const auto offset_var{ctx.var_alloc.Consume(offset)};
@@ -211,7 +211,7 @@ void EmitWriteStorage64(EmitContext& ctx, const IR::Value& binding, const IR::Va
 
 void EmitWriteStorage128(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                          std::string_view value) {
-    if (ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) {
+    if ((ctx.stage == Stage::VertexA || ctx.stage == Stage::VertexB) && !ctx.vs_compute) {
         return;   // WebGPU has no writable storage in vertex shaders
     }
     const auto offset_var{ctx.var_alloc.Consume(offset)};

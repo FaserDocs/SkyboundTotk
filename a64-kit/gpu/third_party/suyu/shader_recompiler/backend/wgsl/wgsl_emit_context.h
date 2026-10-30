@@ -180,6 +180,7 @@ public:
     // read and written through atomicLoad / atomicStore (WGSL atomics need atomic-typed memory)
     std::bitset<64> atomic_ssbo;
     std::array<u8, 64> ssbo_alias{};   // (see ssbo_alias_next)
+    bool vs_compute{};                  // (see vs_as_compute_next)
     std::array<u32, 64> ssbo_alias_words{};
     std::string SsboWord(u32 binding, std::string_view word) const {
         return binding < 64 && ssbo_alias[binding] && ssbo_alias_words[binding]

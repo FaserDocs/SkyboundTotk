@@ -464,6 +464,7 @@ bool init_device(HWND hwnd) {
     dev.bc = wgpuAdapterHasFeature(dev.adapter, WGPUFeatureName_TextureCompressionBC);
     dev.depth_clip_control = wgpuAdapterHasFeature(dev.adapter, WGPUFeatureName_DepthClipControl);
     dev.float32_filterable = wgpuAdapterHasFeature(dev.adapter, WGPUFeatureName_Float32Filterable);
+    dev.float32_blendable = wgpuAdapterHasFeature(dev.adapter, WGPUFeatureName_Float32Blendable);
     dev.depth32_stencil8 = wgpuAdapterHasFeature(dev.adapter, WGPUFeatureName_Depth32FloatStencil8);
     dev.timestamps = env_flag("RX_GPU_TIMING") && wgpuAdapterHasFeature(dev.adapter, WGPUFeatureName_TimestampQuery);
     if (dev.timestamps) have.push_back(WGPUFeatureName_TimestampQuery);
@@ -2622,7 +2623,14 @@ Image* find_render_target(uint64_t gpu_va, uint32_t width, uint32_t height, Pixe
     case PixelFormat::R16G16_UNORM:
     case PixelFormat::R16G16_SNORM: format = WGPUTextureFormat_RG16Float; break;
     case PixelFormat::R16G16B16A16_UNORM:
-    case PixelFormat::R16G16B16A16_SNORM: format = WGPUTextureFormat_RGBA16Float; break;
+    case PixelFormat::R16G16B16A16_SNORM: {
+        // (float32: exact for every 16-bit value. TOTK's object-id target, which Ultrahand reads the object under the
+        // reticle from, is RGBA16 UNORM: as float16 an id came back a few off, the pick named no object and Ultrahand
+        // never locked on: SkyboundTotk issue 9. RX_NORM16_HALF=1: float16, as before)
+        static const bool half = env_flag("RX_NORM16_HALF");
+        format = dev.float32_blendable && !half ? WGPUTextureFormat_RGBA32Float : WGPUTextureFormat_RGBA16Float;
+        break;
+    }
     default: break;
     }
     if (format == WGPUTextureFormat_Undefined) {
@@ -3403,7 +3411,8 @@ struct TargetWriteback {
     uint32_t slice = 0, depth = 1;   // a 3D texture's slice: which, of how many
     bool pitch_linear = false, block_view = false;
     int pf = 0;
-    uint8_t norm16 = 0;   // the texture is the float16 stand-in of a 16-bit unorm (1) / snorm (2) format
+    uint8_t norm16 = 0;   // the texture is the float16 stand-in of a 16-bit unorm (1) / snorm (2) format (3 / 4: float32)
+    uint32_t src_row = 0;   // bytes per row read back (the texture's texels; row: the guest's)
 };
 
 static float half_value(uint16_t h) {
@@ -3413,16 +3422,17 @@ static float half_value(uint16_t h) {
 }
 
 /// 1 / 2 when <texture> is the float16 stand-in rx draws a 16-bit unorm / snorm target into (no 16-bit norm
-/// render targets without RX_NORM16_RT): same size per texel, values to convert. 0 otherwise.
+/// render targets without RX_NORM16_RT): same size per texel, values to convert; 3 / 4 for a float32 stand-in (RGBA
+/// 16: twice the size per texel). 0 otherwise.
 static uint8_t norm16_stand_in(PixelFormat pf, WGPUTextureFormat texture) {
     using P = PixelFormat;
     switch (pf) {
     case P::R16_UNORM: return texture == WGPUTextureFormat_R16Float ? 1 : 0;
     case P::R16G16_UNORM: return texture == WGPUTextureFormat_RG16Float ? 1 : 0;
-    case P::R16G16B16A16_UNORM: return texture == WGPUTextureFormat_RGBA16Float ? 1 : 0;
+    case P::R16G16B16A16_UNORM: return texture == WGPUTextureFormat_RGBA16Float ? 1 : texture == WGPUTextureFormat_RGBA32Float ? 3 : 0;
     case P::R16_SNORM: return texture == WGPUTextureFormat_R16Float ? 2 : 0;
     case P::R16G16_SNORM: return texture == WGPUTextureFormat_RG16Float ? 2 : 0;
-    case P::R16G16B16A16_SNORM: return texture == WGPUTextureFormat_RGBA16Float ? 2 : 0;
+    case P::R16G16B16A16_SNORM: return texture == WGPUTextureFormat_RGBA16Float ? 2 : texture == WGPUTextureFormat_RGBA32Float ? 4 : 0;
     default: return 0;
     }
 }
@@ -3432,7 +3442,20 @@ static uint8_t norm16_stand_in(PixelFormat pf, WGPUTextureFormat texture) {
 void apply_target_writeback(const TargetWriteback& t, const uint8_t* q, bool counted) {
     const uint32_t w = t.w, h = t.h, bpp = t.bpp, row = t.row;
     std::vector<uint8_t> conv;
-    if (t.norm16) {   // (float16 back to the guest's 16-bit norm values)
+    if (t.norm16 >= 3) {   // (float32 back to the guest's 16-bit norm values: rows src_row apart, 16 bytes a texel)
+        conv.assign((size_t)row * h, 0);
+        for (uint32_t y = 0; y < h; y++)
+            for (uint32_t i = 0; i < w * 4; i++) {
+                float f;
+                std::memcpy(&f, q + (size_t)y * t.src_row + 4 * i, 4);
+                if (f != f) f = 0;
+                const uint16_t v = t.norm16 == 3 ? (uint16_t)std::lround(std::clamp(f, 0.0f, 1.0f) * 65535.0f)
+                                                 : (uint16_t)(int16_t)std::lround(std::clamp(f, -1.0f, 1.0f) * 32767.0f);
+                std::memcpy(conv.data() + (size_t)y * row + 2 * i, &v, 2);
+            }
+        q = conv.data();
+        if (counted) count("rt_writeback_norm16");
+    } else if (t.norm16) {   // (float16 back to the guest's 16-bit norm values)
         conv.assign(q, q + (size_t)row * h);
         for (uint32_t y = 0; y < h; y++) {
             uint8_t* p = conv.data() + (size_t)y * row;
@@ -3539,17 +3562,18 @@ void writeback_targets() {
         if (im->guest >> 32) t.slice = im->slice, t.depth = std::max(1u, im->volume_depth);
         t.pf = (int)pf;
         t.norm16 = norm16;
+        t.src_row = norm16 >= 3 ? (t.w * 16 + 255) & ~255u : t.row;
         WGPUBufferDescriptor bd{};
         bd.label = sv("rx target writeback");
         bd.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
-        bd.size = (uint64_t)t.row * t.h;
+        bd.size = (uint64_t)t.src_row * t.h;
         WGPUBuffer staging = wgpuDeviceCreateBuffer(dev.device, &bd);
         WGPUTexelCopyTextureInfo src{};
         src.texture = im->tex;
         src.aspect = WGPUTextureAspect_All;
         WGPUTexelCopyBufferInfo dst{};
         dst.buffer = staging;
-        dst.layout.bytesPerRow = t.row;
+        dst.layout.bytesPerRow = t.src_row;
         dst.layout.rowsPerImage = t.h;
         const WGPUExtent3D extent{t.w, t.h, 1};
         if (RX_WEB_MT) {

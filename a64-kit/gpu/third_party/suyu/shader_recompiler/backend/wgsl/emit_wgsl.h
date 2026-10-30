@@ -55,6 +55,11 @@ struct Options {
 extern thread_local std::array<u8, 64> ssbo_alias_next;
 /// ...and where descriptor j's data starts in descriptor i's binding, in words (overlapping ranges merged into one)
 extern thread_local std::array<u32, 64> ssbo_alias_words_next;
+/// For the next EmitWGSL of a vertex program on this thread: emit it as a compute program instead (one invocation per
+/// vertex: x the vertex index, y the instance), with its storage writes, which WebGPU's vertex stage cannot make
+/// (TOTK's Ultrahand reads the object under the reticle in a one-point draw whose vertex program stores it). Its outputs
+/// are dropped. Only for vertex programs whose attributes are all pulled (vertex_pull) or none. Reset by the emission.
+extern thread_local bool vs_as_compute_next;
 
 [[nodiscard]] std::string EmitWGSL(const Profile& profile, const RuntimeInfo& runtime_info,
                                    IR::Program& program, Bindings& bindings, const Options& options = {});

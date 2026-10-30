@@ -96,6 +96,7 @@ std::string_view StorageFormat(ImageFormat format) {
 
 thread_local std::array<u8, 64> ssbo_alias_next{};
 thread_local std::array<u32, 64> ssbo_alias_words_next{};
+thread_local bool vs_as_compute_next{};
 
 EmitContext::EmitContext(IR::Program& program, Bindings& bindings, const Profile& profile_,
                          const RuntimeInfo& runtime_info_)
@@ -104,6 +105,8 @@ EmitContext::EmitContext(IR::Program& program, Bindings& bindings, const Profile
     ssbo_alias_next = {};
     ssbo_alias_words = ssbo_alias_words_next;
     ssbo_alias_words_next = {};
+    vs_compute = vs_as_compute_next && (stage == Stage::VertexA || stage == Stage::VertexB);
+    vs_as_compute_next = false;
     for (IR::Block* const block : program.blocks) {
         for (IR::Inst& inst : block->Instructions()) {
             const std::string_view name{IR::NameOf(inst.GetOpcode())};
@@ -273,7 +276,7 @@ void EmitContext::DefineStorageBuffers(Bindings& bindings) {
         // compute: every storage buffer read_write (they may share one GPU buffer, and WebGPU forbids a buffer in
         // one dispatch as both read-only and writable storage)
         const bool writable{stage == Stage::Compute ||
-                            (desc.is_written && stage != Stage::VertexA && stage != Stage::VertexB)};
+                            (desc.is_written && ((stage != Stage::VertexA && stage != Stage::VertexB) || vs_compute))};
         const bool atomic{index < 64 && atomic_ssbo[index]};
         header += fmt::format("@group({}) @binding({}) var<storage, {}> {}_ssbo{}: array<{}>;\n", group,
                               bindings.unified, writable || atomic ? "read_write" : "read", stage_name, index,
