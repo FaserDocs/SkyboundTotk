@@ -5,7 +5,10 @@
    TOTK v1.0.0 computes its gameplay cameras' aspect as width / height (an fdiv s0, s0, s1 stored at camera + 176:
    main+0x1968c2c and main+0x1e5eae8) and keeps one 16:9 constant (1.7777780, main+0x377ac54): the same three places
    the TOTK-Ultrawide tool (github.com/Fruithapje21/TOTK-Ultrawide) patches for 1.0.0. Here the division's result
-   becomes hos_view_aspect when that is set (0: the game's own), and the constant follows it. */
+   becomes hos_view_aspect when that is set (0: the game's own), and the constant follows it.
+   A window narrower than 16:9 (16:10, 4:3; SkyboundTotk issue 10) works the same way: the cameras take its aspect (the
+   same height of view, less to the sides, as the game's vertical field of view is fixed) and the 16:9 frame is
+   stretched taller; the HUD is squeezed vertically instead (totk_ultrawide_ui.c), the five UI-scale sites stay. */
 #include "hos.h"
 #include <string.h>
 
@@ -37,7 +40,7 @@ void hos_ultrawide_apply(void) {
    +0x1a8e69c, +0x1a8f18c, +0x1a93954: the places TOTK-Ultrawide hooks); its horizontal one times aspect / (16:9)
    lays the HUD out for the wider view, so after the present's stretch it keeps its proportions. */
 static void ui_scale(Ctx *c) {
-    if (hos_view_aspect <= 0) return;
+    if (hos_view_aspect <= 16.0f / 9.0f) return;   /* (wider than 16:9 only) */
     float f;
     memcpy(&f, &c->vreg[0][0], 4);
     f *= hos_view_aspect / (16.0f / 9.0f);

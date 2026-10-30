@@ -5,7 +5,9 @@
    gets a copy whose layouts have their root pane's horizontal scale set to (16:9) / aspect, except the full-screen
    backgrounds and fades (they fill the view); the copy is cached as <user>/ultrawide_ui/<aspect>.blarc.zs, a zstd
    frame of raw blocks the game's own decompressor reads as it is. The HUD keeps its proportions in the middle of the
-   view (centred, not pushed to the edges). zstd: third_party/zstd (BSD). */
+   view (centred, not pushed to the edges). A window narrower than 16:9 (16:10, 4:3) stretches the frame taller
+   instead: the root pane's vertical scale becomes aspect / (16:9), and the HUD keeps its proportions in a 16:9 band
+   across the middle. zstd: third_party/zstd (BSD). */
 #include "hos.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -83,8 +85,9 @@ static int full_screen(const char *name) {
            strstr(name, "Overlay") || strstr(name, "Pa_Map_00");
 }
 
-/* the layouts narrowed: a .bflyt's root pane (pan1: its name 0x0C in, its scale x 0x38 after the name) */
-static int narrow_layouts(uint8_t *sarc, size_t n, float s1) {
+/* the layouts narrowed: a .bflyt's root pane (pan1: its name 0x0C in, its scale x 0x38 after the name, scale y 0x3C;
+   <axis> 0: x, 1: y) */
+static int narrow_layouts(uint8_t *sarc, size_t n, float s1, int axis) {
     SarcFile files[4096];
     const int count = sarc_files(sarc, n, files, 4096);
     int patched = 0;
@@ -93,8 +96,8 @@ static int narrow_layouts(uint8_t *sarc, size_t n, float s1) {
         const size_t len = strlen(nm);
         if (strncmp(nm, "blyt/", 5) || len < 7 || strcmp(nm + len - 6, ".bflyt") || full_screen(nm)) continue;
         uint8_t *root = find_bytes(files[i].data, files[i].size, "RootPane");
-        if (!root || root + 0x3C > files[i].data + files[i].size) continue;
-        memcpy(root + 0x38, &s1, 4);
+        if (!root || root + 0x40 > files[i].data + files[i].size) continue;
+        memcpy(root + 0x38 + 4 * axis, &s1, 4);
         patched++;
     }
     return patched;
@@ -146,10 +149,12 @@ int hos_ultrawide_redirect(const char *guest, char *out, size_t cap) {
         for (int i = 0; i < k && !sarc; i++)
             if (!strcmp(f[i].name, "zs.zsdic")) sarc = unzstd(arch, an, f[i].data, f[i].size, &sn);
         if (sarc) {
-            const float s1 = (16.0f / 9.0f) / hos_view_aspect;
-            const int n = narrow_layouts(sarc, sn, s1);
+            const int tall = hos_view_aspect < 16.0f / 9.0f;   /* (16:10, 4:3: squeezed vertically) */
+            const float s1 = tall ? hos_view_aspect / (16.0f / 9.0f) : (16.0f / 9.0f) / hos_view_aspect;
+            const int n = narrow_layouts(sarc, sn, s1, tall);
             ok = n > 0 && write_raw_zstd(out, sarc, sn);
-            hos_log("ultrawide: the HUD's layouts narrowed to %.3f (%d layouts) -> %s", s1, n, ok ? out : "(failed)");
+            hos_log("ultrawide: the HUD's layouts %s to %.3f (%d layouts) -> %s", tall ? "squeezed vertically" : "narrowed",
+                    s1, n, ok ? out : "(failed)");
         }
     }
     if (!ok) hos_log("ultrawide: the HUD's layout archive could not be made: the HUD stays stretched");

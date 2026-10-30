@@ -400,10 +400,12 @@ void present_fx_draw(WGPUCommandEncoder e, WGPUTextureView src, uint32_t sw, uin
 }
 bool present_framegen() { return current_settings().framegen; }
 
-/// The window's size (rx_resize): with ultrawide on, a window wider than 16:9 gives the game's cameras its aspect
+/// The window's size (rx_resize): with ultrawide on, a window wider than 16:9, or narrower (16:10, 4:3: SkyboundTotk
+/// issue 10), gives the game's cameras its aspect
 void present_window_size(int32_t w, int32_t h) {
     const float a = w > 0 && h > 0 ? (float)w / (float)h : 0.0f;
-    hos_view_aspect = current_settings().ultrawide && a > 16.0f / 9.0f + 0.01f ? std::min(a, 4.0f) : 0.0f;
+    const bool other = a > 16.0f / 9.0f + 0.01f || (a > 0 && a < 16.0f / 9.0f - 0.01f);
+    hos_view_aspect = current_settings().ultrawide && other ? std::clamp(a, 1.25f, 4.0f) : 0.0f;
     hos_ultrawide_apply();
 }
 }  // namespace rx
