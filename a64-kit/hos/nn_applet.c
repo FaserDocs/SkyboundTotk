@@ -2,6 +2,7 @@
    The answers describe a docked console in English with one user, "Player". */
 #include "hos.h"
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 #ifdef __EMSCRIPTEN__
 #include <windows.h>   /* (the browser build: the Microsoft C runtime's time functions) */
@@ -15,7 +16,51 @@ HLE(_ZN2nn2oe17FinishStartupLogoEv) { hos_log("oe: startup logo finished"); }
 /* GetDesiredLanguage() -> settings::LanguageCode (char[8]) by value */
 HLE(_ZN2nn2oe18GetDesiredLanguageEv) {
     uint64_t v = 0;
-    memcpy(&v, "en-US", 5);
+    char lang[8] = "en-US";
+
+    FILE *f = fopen("language.txt", "r");
+    if (f) {
+        if (fgets(lang, sizeof(lang), f)) {
+            lang[strcspn(lang, "\r\n")] = 0;
+        }
+        fclose(f);
+    }
+
+    const char *supported_langs[] = {
+        // Full localization (Text + Voice acting)
+        "ru",             // Russian
+        "en-US", "en-GB", // English
+        "ja",             // Japanese
+        "fr", "fr-CA",    // French (European / Canadian)
+        "de",             // German
+        "es", "es-419",   // Spanish (Castilian / Latin American)
+        "it",             // Italian
+        
+        // Partial localization (Text only)
+        "nl",             // Dutch
+        "ko",             // Korean
+        "zh-CN",          // Chinese (Simplified)
+        "zh-TW",          // Chinese (Traditional)
+        
+        // Additional regional standards
+        "pt", "pt-BR"     // Portuguese
+    };
+
+    int is_valid = 0;
+    int num_langs = sizeof(supported_langs) / sizeof(supported_langs[0]);
+    
+    for (int i = 0; i < num_langs; i++) {
+        if (strcmp(lang, supported_langs[i]) == 0) {
+            is_valid = 1;
+            break;
+        }
+    }
+
+    if (!is_valid) {
+        strcpy(lang, "en-US"); 
+    }
+
+    memcpy(&v, lang, 8);
     RET(v);
 }
 HLE(_ZN2nn2oe16GetOperationModeEv) { RET(1); }        /* OperationMode_Console (docked) */
