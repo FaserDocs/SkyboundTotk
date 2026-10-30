@@ -1,3 +1,4 @@
+"""Build SkyboundTOTK from an already-extracted TOTK 1.0.0 dump."""
 import hashlib
 import json
 import os
@@ -29,7 +30,7 @@ def setup_logging():
             logging.FileHandler(log_file, encoding="utf-8")
         ]
     )
-    logging.info("=== Запуск скрипта сборки ===")
+    logging.info("=== build started ===")
 
 
 def log_and_print(message):
