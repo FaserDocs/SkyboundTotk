@@ -2497,21 +2497,38 @@ void trim_pipelines() {
         const char* e = getenv("RX_PIPELINE_CAP");
         return (size_t)(e && atoi(e) > 0 ? atoi(e) : 6000);
     }();
+    // (a hard ceiling: past it, pipelines unused for a minute go too. Pipelines used within the TTL were never
+    // released, and each holds ~390 KB of host memory: a long session reached ~14,300 pipelines, 17 GB private and
+    // "Not enough memory left" in wgpuDeviceCreateBuffer, SkyboundTotk issue 10. A pipeline needed again is
+    // compiled again, its draws skipped meanwhile. RX_PIPELINE_HARD_CAP=<n> (1.5x the cap), RX_PIPELINE_HARD_TTL_S)
+    static const size_t hard = [] {
+        const char* e = getenv("RX_PIPELINE_HARD_CAP");
+        return e && atoi(e) > 0 ? (size_t)atoi(e) : cap + cap / 2;
+    }();
+    static const int64_t hard_ttl = [] {
+        const char* e = getenv("RX_PIPELINE_HARD_TTL_S");
+        return (int64_t)(e ? atoi(e) : 60) * 60;
+    }();
     if (ttl <= 0 || pipelines.size() <= cap) return;
-    std::vector<std::pair<int64_t, uint64_t>> old;
-    for (const auto& [key, p] : pipelines)
-        if (p->state.load() == 1 && p->last_used < frame_number - ttl) old.emplace_back(p->last_used, key);
-    std::sort(old.begin(), old.end());
-    size_t dropped = 0;
-    for (const auto& [used, key] : old) {
-        if (pipelines.size() <= cap - cap / 8) break;
-        auto it = pipelines.find(key);
-        if (it == pipelines.end()) continue;
-        release_pipeline_later(it->second->pipeline);
-        pipelines.erase(it);
-        dropped++;
-    }
-    if (dropped) hos_log("rx: %zu pipelines unused for %lld s released (%zu kept)", dropped, (long long)(ttl / 60), pipelines.size());
+    const auto release = [](int64_t unused_frames, size_t down_to) {
+        std::vector<std::pair<int64_t, uint64_t>> old;
+        for (const auto& [key, p] : pipelines)
+            if (p->state.load() == 1 && p->last_used < frame_number - unused_frames) old.emplace_back(p->last_used, key);
+        std::sort(old.begin(), old.end());
+        size_t dropped = 0;
+        for (const auto& [used, key] : old) {
+            if (pipelines.size() <= down_to) break;
+            auto it = pipelines.find(key);
+            if (it == pipelines.end()) continue;
+            release_pipeline_later(it->second->pipeline);
+            pipelines.erase(it);
+            dropped++;
+        }
+        if (dropped) hos_log("rx: %zu pipelines unused for %lld s released (%zu kept)", dropped,
+                             (long long)(unused_frames / 60), pipelines.size());
+    };
+    release(ttl, cap - cap / 8);
+    if (pipelines.size() > hard && hard_ttl > 0 && hard_ttl < ttl) release(hard_ttl, hard - std::min(hard, cap / 8));
 }
 
 // ---- the native NVN layer: draws, from NVN state (rx_nvn.cpp's replay) ----
