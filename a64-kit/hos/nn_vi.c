@@ -312,7 +312,7 @@ static void frame_step_present(int64_t now) {
     for (int i = 0; i < n; i++) sum += samples[i];
     InterlockedExchange64(&frame_step_bits, (LONG64)step_bits((float)(sum / n)));
 }
-SPLICE_AFTER(0x087a83e4, "int64_t _o=8; { uint64_t _p0=0,_p1=0;") {
+static void frame_step_into_vi(Ctx *c) {
     if (!realtime_on()) return;
     const uint64_t v = frame_step();
     G32(c->x[0] + 8) = (uint32_t)v;
@@ -320,10 +320,17 @@ SPLICE_AFTER(0x087a83e4, "int64_t _o=8; { uint64_t _p0=0,_p1=0;") {
     c->vreg[0][0] = (uint32_t)v;
     c->vreg[1][0] = (uint32_t)(v >> 32);
 }
-SPLICE_AFTER(0x088f689c, "recomp_store32(c,(c->x[8]+0ULL),_v); } }") {
+static void frame_step_store(Ctx *c) {
     if (!realtime_on()) return;
     G32(c->x[8]) = (uint32_t)frame_step();
 }
+#if HOS_GAME_VERSION == 121
+SPLICE_AFTER(0x087ede6c, "int64_t _o=8; { uint64_t _p0=0,_p1=0;") { frame_step_into_vi(c); }
+SPLICE_AFTER(0x088f2378, "recomp_store32(c,(c->x[8]+0ULL),_v); } }") { frame_step_store(c); }
+#else
+SPLICE_AFTER(0x087a83e4, "int64_t _o=8; { uint64_t _p0=0,_p1=0;") { frame_step_into_vi(c); }
+SPLICE_AFTER(0x088f689c, "recomp_store32(c,(c->x[8]+0ULL),_v); } }") { frame_step_store(c); }
+#endif
 
 static void totk_set_interval(int n) {
     if (!totk_ctl) return;

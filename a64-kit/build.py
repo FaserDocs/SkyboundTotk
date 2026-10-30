@@ -36,15 +36,90 @@ def dirs(a):
     return root, os.path.join(root, "image"), os.path.join(root, "gen"), os.path.join(root, "native")
 
 
+# Game update the hooks in hos/*.c are anchored for, by the main module's build id. An update that moves
+# functions moves every address hook with it, so the hooks compile their version's addresses (hos.h:
+# HOS_GAME_VERSION); sdk and rtld are unchanged between these updates and keep their addresses.
+GAME_VERSIONS = {"082ce09b": 100, "9b4e4365": 121}
+
+
+def game_version(img_dir):
+    """HOS_GAME_VERSION for the image the build lifts: 1.0.0 unless its main module is a known update."""
+    path = os.path.join(img_dir, "image.json")
+    if not os.path.exists(path):
+        return 100
+    main = next((m for m in json.load(open(path)).get("modules", []) if m.get("name") == "main"), None)
+    version = GAME_VERSIONS.get((main or {}).get("build_id", "")[:8], 100)
+    print("game version: %d (main build id %s)" % (version, (main or {}).get("build_id", "?")[:16]))
+    return version
+
+
+def _version_condition(expr, version):
+    """The value of a preprocessor condition that only tests HOS_GAME_VERSION, True/False; None when it is not one
+    (another macro: the source is scanned as it is)."""
+    e = re.sub(r"\bHOS_GAME_VERSION\b", str(version), expr.strip())
+    e = re.sub(r"(?<=\d)\s*(?=[<>=!])|(?<=[<>=!])\s*(?=\d)", "", e)
+    if not re.fullmatch(r"[\d\s()!<>=&|]+", e) or not re.search(r"\d", e):
+        return None
+    e = e.replace("&&", " and ").replace("||", " or ")
+    e = re.sub(r"!(?!=)", " not ", e)
+    try:
+        return bool(eval(e, {"__builtins__": {}}, {}))
+    except Exception:
+        return None
+
+
+def hos_source(path, version):
+    """A hos/*.c with the #if blocks that pick a game update resolved for `version`: both versions' ENTRY_HOOK /
+    SPLICE_AFTER lines are in the file, but only this one's may be spliced into the lift (the other version's
+    addresses exist in this image too, as other functions). Other conditions are left as they are."""
+    out, stack, active = [], [], True
+    for line in open(path).read().split("\n"):
+        s = line.strip()
+        m = re.match(r"#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)", s)
+        if not m:
+            if active:
+                out.append(line)
+            continue
+        kind, rest = m.group(1), m.group(2).strip()
+        if kind in ("if", "ifdef", "ifndef"):
+            value = _version_condition(rest, version) if kind == "if" else None
+            if kind != "if" and rest == "HOS_GAME_VERSION":
+                value = kind == "ifdef"   # (build.py always defines it)
+            parent = active
+            known = value is not None
+            taken = bool(value) if known else False
+            stack.append([parent, known, taken])
+            active = parent and (value if known else True)
+        elif kind == "elif" and stack:
+            parent, known, taken = stack[-1]
+            value = _version_condition(rest, version) if known else None
+            if known and value is not None:
+                stack[-1][2] = taken or value
+                active = parent and value and not taken
+            else:
+                active = parent
+        elif kind == "else" and stack:
+            parent, known, taken = stack[-1]
+            if known:
+                active = parent and not taken
+                stack[-1][2] = True
+            else:
+                active = parent
+        elif kind == "endif" and stack:
+            active = stack.pop()[0]
+    return "\n".join(out)
+
+
 def entry_hooks(img_dir=None):
     """Lifted functions with an entry hook in hos/*.c, address -> the hook's C name: ENTRY_HOOK(0x0xxxxxxx), and
     ENTRY_HOOK_SYM(name) for a function the image exports by that name (image/image.json)."""
     out = {}
     exports = None
+    version = game_version(img_dir) if img_dir else 100
     for f in sorted(os.listdir(HOS)):
         if not f.endswith(".c"):
             continue
-        src = open(os.path.join(HOS, f)).read()
+        src = hos_source(os.path.join(HOS, f), version)
         for a in re.findall(r"^ENTRY_HOOK\((0x[0-9a-fA-F]+)\)", src, re.M):
             if len(a) != 10:
                 sys.exit("%s: ENTRY_HOOK(%s): write the address with 8 hex digits" % (f, a))
@@ -94,13 +169,14 @@ def apply_entry_hooks(gen, img_dir=None):
     json.dump({str(k): v for k, v in sorted(want.items())}, open(state, "w"))
 
 
-def splices():
+def splices(img_dir):
     """SPLICE_AFTER(0x0xxxxxxx, "text") in hos/*.c: address -> the anchor text (the C string literal's contents)."""
     out = {}
+    version = game_version(img_dir)
     for f in sorted(os.listdir(HOS)):
         if not f.endswith(".c"):
             continue
-        src = open(os.path.join(HOS, f)).read()
+        src = hos_source(os.path.join(HOS, f), version)
         for each, a, text in re.findall(r'^SPLICE_AFTER(_EACH)?\((0x[0-9a-fA-F]+),\s*"((?:[^"\\]|\\.)*)"\)', src, re.M):
             if len(a) != 10:
                 sys.exit("%s: SPLICE_AFTER(%s): write the address with 8 hex digits" % (f, a))
@@ -109,21 +185,22 @@ def splices():
     return out
 
 
-def apply_splices(gen):
+def apply_splices(gen, img_dir):
     """Put `splice_0x...(c);` after the first line of each spliced lifted function that contains its anchor, and
     take out the ones no longer wanted. Files are only rewritten when the set changed (gen/splices.json)."""
-    want = splices()
+    want = splices(img_dir)
     state = os.path.join(gen, "splices.json")
     have = {int(k): v for k, v in json.load(open(state)).items()} if os.path.exists(state) else {}
     if want == have:
         return
-    found = set()
+    found, lifted = set(), set()
     for f in sorted(os.listdir(gen)):
         if not (f.startswith("code_") and f.endswith(".c")):
             continue
         path = os.path.join(gen, f)
         src = open(path, encoding="utf-8", errors="surrogateescape").read()
         funcs = {int(m, 16) for m in re.findall(r"^void f_([0-9a-f]{8})\(Ctx \*__restrict (?:A64_NOESC )?c\) \{$", src, re.M)}
+        lifted |= funcs
         if not (set(want) | set(have)) & funcs:
             continue
         lines = [l for l in src.split("\n") if not l.startswith("    splice_0x") and not l.startswith("void splice_0x")]
@@ -145,9 +222,13 @@ def apply_splices(gen):
         out[1:1] = decls
         open(path, "w", encoding="utf-8", errors="surrogateescape").write("\n".join(out))
         print("splices in %s: %s" % (f, ", ".join(d[5:-8] for d in decls) or "none"))
-    missing = set(want) - found
+    # (a splice for a function this image does not have is another game version's: left out, not an error)
+    missing = (set(want) - found) & lifted
     if missing:
         sys.exit("SPLICE_AFTER: anchor not found in lifted %s" % ", ".join("f_%08x" % a for a in sorted(missing)))
+    other = (set(want) - found) - lifted
+    if other:
+        print("splices: not in this image (another game version): %s" % ", ".join("f_%08x" % a for a in sorted(other)))
     json.dump({str(k): v for k, v in sorted(want.items())}, open(state, "w"))
 
 
@@ -498,6 +579,9 @@ def cmd_native(a):
     os.makedirs(obj_dir, exist_ok=True)
     cc = toolchain.need(toolchain.find("clang"))
     base = toolchain.native_target() + ["-I" + gen, "-I" + RT, "-Wno-everything", "-fno-strict-aliasing", "-mcx16"]
+    # The OS layer compiles for the game update (hos.h's HOS_GAME_VERSION; the lifted code has no address hooks in
+    # it, so the lifted objects' keys stay the same when only the update differs).
+    hos_flags = ["-DHOS_GAME_VERSION=%d" % game_version(img_dir)]
     # RX_MARCH (e.g. x86-64-v3: AVX2/BMI2/FMA; the default runs on any x86-64). Measured twice without a gain: 10-16
     # (rain) and 10-22 (castle, game threads bound: 3 interleaved rounds, mixed, median 69.4 vs 73.2 fps).
     if os.environ.get("RX_MARCH"):
@@ -523,7 +607,7 @@ def cmd_native(a):
         runtime += [os.path.join(linux_hos, f) for f in sorted(os.listdir(linux_hos)) if f.endswith(".c")]
     # lifted chunks include only rt/ and generated headers; the OS layer also includes hos/*.h and the renderer's API
     apply_entry_hooks(gen, img_dir)
-    apply_splices(gen)
+    apply_splices(gen, img_dir)
     deps_lifted = headers_key(RT, gen)
     deps_runtime = headers_key(RT, HOS, gen, os.path.join(GPU, "render"), *([linux_hos] if linux else []))
     # the renderer: WebGPU through wgpu-native (a release of github.com/gfx-rs/wgpu-native: include/, lib/)
@@ -551,7 +635,9 @@ def cmd_native(a):
         # (the profile's hot functions, lifted with A64_HOT_CHUNK=1: RX_HOT_CFLAGS, e.g. a higher inline threshold)
         if os.path.basename(src) == "code_hot.c" and os.environ.get("RX_HOT_CFLAGS"):
             flags = flags + os.environ["RX_HOT_CFLAGS"].split()
-        jobs.append((cc, src, os.path.join(obj_dir, os.path.basename(src)[:-2] + ".o"), base + flags, deps))
+        hos = os.path.dirname(src) == HOS
+        jobs.append((cc, src, os.path.join(obj_dir, os.path.basename(src)[:-2] + ".o"),
+                     base + (hos_flags if hos else []) + flags, deps))
     # libopus (third_party/opus, the 1.5.2 release sources: nn::codec's hardware Opus decoder in hos/nn_codec.c)
     opus = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "third_party", "opus")
     if os.path.isfile(os.path.join(opus, "sources.txt")):
@@ -669,6 +755,7 @@ def cmd_web(a):
     # (A64_WRITE_TRACK: guest stores mark their pages: the renderer's write watch, rt/a64.h)
     common = ["-pthread", "-mtail-call", "-msimd128", "-msse2", "-DA64_MEM_ZERO", "-DA64_WRITE_TRACK", "-fno-delete-null-pointer-checks",
               "-fno-strict-aliasing", "-Wno-everything", "-I" + gen, "-I" + RT]
+    hos_flags = ["-DHOS_GAME_VERSION=%d" % game_version(img_dir)]
     jobs = []
     # RX_WEB_MT=1: the threaded web build (gpu/render/rx_web_mt.h: a WebGPU thread replays what the renderer's thread
     # records), totk_mt.js + index_mt.html beside the other: its runtime and renderer objects are its own (mt_*), the
@@ -676,7 +763,7 @@ def cmd_web(a):
     mt = os.environ.get("RX_WEB_MT") == "1"
     mt_flags, mt_pre = (["-DRX_WEB_MT=1"], "mt_") if mt else ([], "")
     apply_entry_hooks(gen, img_dir)
-    apply_splices(gen)
+    apply_splices(gen, img_dir)
     deps_lifted = headers_key(RT, gen)
     lifted = sorted(os.path.join(gen, f) for f in os.listdir(gen) if f.endswith(".c"))
     fpx = ["-DA64_FPX_FN=static inline __attribute__((always_inline))"] if os.environ.get("RX_FPX_INLINE") else []
@@ -693,7 +780,8 @@ def cmd_web(a):
         rflags = common + mt_flags + ["-I" + web_hos, "-I" + HOS, "-I" + os.path.join(opus, "include"), "-O2", "-g"]
         for src in runtime:
             name = mt_pre + ("web_" if os.path.dirname(src) == web_hos else "") + os.path.basename(src)[:-2]
-            jobs.append((emcc, src, os.path.join(obj_dir, name + ".o"), rflags, deps_runtime))
+            flags = rflags + (hos_flags if os.path.dirname(src) == HOS else [])
+            jobs.append((emcc, src, os.path.join(obj_dir, name + ".o"), flags, deps_runtime))
         oflags = ["-pthread", "-msimd128", "-O2", "-g0", "-Wno-everything", "-DOPUS_BUILD", "-DUSE_ALLOCA",
                   "-DHAVE_LRINTF", "-DHAVE_LRINT"] + ["-I" + os.path.join(opus, d) for d in
                                                        ("include", "celt", "silk", "silk/float", "src")]

@@ -17,8 +17,8 @@
      new game, tested): A there never reaches the game, the link opens and the window stays; the second button is
      its Cancel, so A goes through (closing it) and the cursor is moved back to "Ported By". Without a save (no
      Continue, so New Game would start at once) the entry opens the NotRexed link directly.
-   Addresses and offsets are TOTK v1.0.0's. HOS_NO_CREDITS=1 leaves the menu alone; HOS_CREDITS_DRYRUN=1 logs the
-   links instead of opening them (test runs). */
+   Addresses are TOTK v1.0.0's and 1.2.1's (HOS_GAME_VERSION); the offsets are the same in both. HOS_NO_CREDITS=1
+   leaves the menu alone; HOS_CREDITS_DRYRUN=1 logs the links instead of opening them (test runs). */
 #include "hos.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,12 +27,36 @@
 #include <windows.h>
 #include <shellapi.h>
 
+/* v1.2.1's main moved every function the credits use (the addresses below by HOS_GAME_VERSION): the ui2d / text
+   helpers and the title menu and system window classes keep their layout. The credits are cosmetic: without them
+   the title flow runs as usual. */
+#if HOS_GAME_VERSION == 121
+void f_08701650(Ctx *);   /* (ui2d layout of a UI object, +40; pane name) -> pane */
+void f_08b519b0(Ctx *);   /* (same layout; "Part/Pane" path; message view; 1; 0): set a text pane's string */
+void f_08b517f0(Ctx *);   /* (message view): empty view { text 0, length 0, message -1 } */
+void f_08b51940(Ctx *);   /* (message view, &file name, &label, 1): the view of that message */
+void f_09b29508(Ctx *);   /* system window: (window, button index, message index) -> that button's label */
+void f_09b295c4(Ctx *);   /* system window: (window, message) -> its text */
+#define F_LAYOUT f_08701650
+#define F_SETTEXT f_08b519b0
+#define F_EMPTY f_08b517f0
+#define F_VIEW f_08b51940
+#define F_LABELS f_09b29508   /* system window: (window, button index, message index) -> that button's label */
+#define F_MESSAGE f_09b295c4  /* system window: (window, message) -> its text */
+#else
 void f_086f7164(Ctx *);   /* (ui2d layout of a UI object, +40; pane name) -> pane */
 void f_08b90810(Ctx *);   /* (same layout; "Part/Pane" path; message view; 1; 0): set a text pane's string */
 void f_08b906ec(Ctx *);   /* (message view): empty view { text 0, length 0, message -1 } */
 void f_08b907a0(Ctx *);   /* (message view, &file name, &label, 1): the view of that message */
 void f_09ad99dc(Ctx *);   /* system window: (window, button index, message index) -> that button's label */
 void f_09ad9a98(Ctx *);   /* system window: (window, message) -> its text */
+#define F_LAYOUT f_086f7164
+#define F_SETTEXT f_08b90810
+#define F_EMPTY f_08b906ec
+#define F_VIEW f_08b907a0
+#define F_LABELS f_09ad99dc   /* system window: (window, button index, message index) -> that button's label */
+#define F_MESSAGE f_09ad9a98  /* system window: (window, message) -> its text */
+#endif
 
 enum {
     PANE_FLAG = 0x58, PANE_NAME = 0xB0,                      /* nn::ui2d::Pane */
@@ -112,7 +136,7 @@ static uint64_t push_wstr(uint64_t *top, const char *s) {
 static uint64_t find_pane(Ctx *c, uint64_t layout, const char *name) {
     uint64_t top = c->x[31] - 256;
     const uint64_t n = push_str(&top, name);
-    const uint64_t pane = call(c, f_086f7164, top - 64, layout, n, 0, 0, 0);
+    const uint64_t pane = call(c, F_LAYOUT, top - 64, layout, n, 0, 0, 0);
     if (pane && strcmp((const char *)GP(pane + PANE_NAME), name) != 0) {
         hos_log("title: pane %s at %#llx has another name: not the layout this was written for", name,
                 (unsigned long long)pane);
@@ -130,7 +154,7 @@ static int set_text(Ctx *c, uint64_t layout, const char *path, const char *text)
     G64(top) = t;
     *(uint32_t *)GP(top + 8) = (uint32_t)strlen(text);
     G64(top + 16) = ~0ULL;
-    return (int)(call(c, f_08b90810, top - 64, layout, p, top, 1, 0) & 1);
+    return (int)(call(c, F_SETTEXT, top - 64, layout, p, top, 1, 0) & 1);
 }
 
 /* Our text, but carrying a game message's identity: a chosen button posts the message file and label behind its text
@@ -147,14 +171,14 @@ static int set_text_as(Ctx *c, uint64_t layout, const char *path, const char *te
     G64(fobj + 8) = strlen(file);
     G64(lobj) = l;
     G64(lobj + 8) = strlen(label);
-    call(c, f_08b906ec, top - 64, view, 0, 0, 0, 0);
-    if (!(call(c, f_08b907a0, top - 64, view, fobj, lobj, 1, 0) & 1)) {
+    call(c, F_EMPTY, top - 64, view, 0, 0, 0, 0);
+    if (!(call(c, F_VIEW, top - 64, view, fobj, lobj, 1, 0) & 1)) {
         hos_log("title: no message %s:%s", file, label);
         return set_text(c, layout, path, text);
     }
     G64(view) = t;
     *(uint32_t *)GP(view + 8) = (uint32_t)strlen(text);
-    return (int)(call(c, f_08b90810, top - 64, layout, p, view, 1, 0) & 1);
+    return (int)(call(c, F_SETTEXT, top - 64, layout, p, view, 1, 0) & 1);
 }
 
 /* The title menu reports each hover through f_09ada6c0 (menu, button): at the first one its layout is ready. Shows
@@ -192,19 +216,19 @@ static void setup_menu(Ctx *c, uint64_t m) {
     hos_log("title: credits added as entries %d and %d%s", shown, shown + 1, has_save ? "" : " (no save)");
 }
 
-ENTRY_HOOK(0x09ada6c0) {
+static int on_menu_hover(Ctx *c) {
     if (credits_off() || in_call) return 0;
     if (c->x[0] != menu || !ported_btn) setup_menu(c, c->x[0]);
     return 0;
 }
 
 /* the system window's button labels: (window, index, message index) */
-ENTRY_HOOK(0x09ad99dc) {
+static int on_window_label(Ctx *c) {
     if (credits_off() || in_call || !window_wanted) return 0;
     window = c->x[0];
     window_seen = hos_present_count;
     const uint32_t i = (uint32_t)c->x[1];
-    call(c, f_09ad99dc, c->x[31] - 64, c->x[0], c->x[1], c->x[2], c->x[3], c->x[4]);
+    call(c, F_LABELS, c->x[31] - 64, c->x[0], c->x[1], c->x[2], c->x[3], c->x[4]);
     char path[40];
     snprintf(path, sizeof path, "Pa_Button_%02u/T_Btn_00", i);
     set_text_as(c, G64(window + UI_LAYOUT), path, i == 0 ? "NotRexed" : "slqnt", "LayoutMsg/SystemWindow_00", "1001");
@@ -212,11 +236,11 @@ ENTRY_HOOK(0x09ad99dc) {
 }
 
 /* the system window's message: (window, message) */
-ENTRY_HOOK(0x09ad9a98) {
+static int on_window_message(Ctx *c) {
     if (credits_off() || in_call || !window_wanted) return 0;
     window = c->x[0];
     window_seen = hos_present_count;
-    call(c, f_09ad9a98, c->x[31] - 64, c->x[0], c->x[1], c->x[2], c->x[3], c->x[4]);
+    call(c, F_MESSAGE, c->x[31] - 64, c->x[0], c->x[1], c->x[2], c->x[3], c->x[4]);
     set_text(c, G64(window + UI_LAYOUT), "T_Text_00", PORTED);
     return 1;
 }
@@ -224,7 +248,7 @@ ENTRY_HOOK(0x09ad9a98) {
 /* the system window's per-frame update: (window, ...). The game writes the window's message once more when it
    opens, so ours goes back in during its first moments. */
 static int64_t window_opened;
-ENTRY_HOOK(0x09ad9858) {
+static int on_window_update(Ctx *c) {
     if (credits_off() || in_call || !window || c->x[0] != window) return 0;
     const int64_t now = hos_now_ns();
     window_seen = hos_present_count;
@@ -232,6 +256,18 @@ ENTRY_HOOK(0x09ad9858) {
     if (now - window_opened < 1500000000LL) set_text(c, G64(window + UI_LAYOUT), "T_Text_00", PORTED);
     return 0;
 }
+
+#if HOS_GAME_VERSION == 121
+ENTRY_HOOK(0x09b2a2b8) { return on_menu_hover(c); }
+ENTRY_HOOK(0x09b29508) { return on_window_label(c); }
+ENTRY_HOOK(0x09b295c4) { return on_window_message(c); }
+ENTRY_HOOK(0x09b29384) { return on_window_update(c); }
+#else
+ENTRY_HOOK(0x09ada6c0) { return on_menu_hover(c); }
+ENTRY_HOOK(0x09ad99dc) { return on_window_label(c); }
+ENTRY_HOOK(0x09ad9a98) { return on_window_message(c); }
+ENTRY_HOOK(0x09ad9858) { return on_window_update(c); }
+#endif
 
 static int menu_taking_input(void) {
     return menu && G64(menu) == menu_vtable && *(uint32_t *)GP(menu + MENU_STATE) == 3 &&
