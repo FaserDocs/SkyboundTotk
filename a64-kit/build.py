@@ -803,7 +803,8 @@ def main():
                                 "(0: never; on TOTK it finds only 60 cuts, its giant functions are loops end to end)")
         if name == "web":
             s.add_argument("--opt", default="O2")
-            s.add_argument("-j", "--jobs", type=int, default=os.cpu_count())
+            s.add_argument("-j", "--jobs", type=int, default=toolchain.default_jobs(),
+                           help="parallel compiles (default: what fits in 80%% of the memory at 3.5 GB each; RX_JOBS)")
             s.add_argument("--lifted-only", action="store_true", help="compile the lifted code and stop")
             s.add_argument("--guest-mb", type=int, default=3456, help="the guest window (wasm memory below the host's; hos_mem.c sizes the game's heap to leave its regions room)")
         if name == "native":
@@ -812,7 +813,8 @@ def main():
             # 66.7 -> 69.7 fps, ahead in each of 3 interleaved rounds, 2026-10-21; exe +11 MB)
             s.add_argument("--opt", default="O3", help="optimization of the lifted code (O1 builds faster)")
             s.add_argument("--debug", action="store_true", help="debug info for the lifted code too")
-            s.add_argument("-j", "--jobs", type=int, default=os.cpu_count())
+            s.add_argument("-j", "--jobs", type=int, default=toolchain.default_jobs(),
+                           help="parallel compiles (default: what fits in 80%% of the memory at 3.5 GB each; RX_JOBS)")
             s.add_argument("--wgpu", help="a wgpu-native release (include/, lib/): builds the WebGPU renderer")
             s.add_argument("-o", "--output", help="the executable's name (default: the game's; e.g. to link while it runs)")
         if name == "run":
