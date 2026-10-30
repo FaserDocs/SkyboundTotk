@@ -48,6 +48,13 @@ static void sync_keys(void) {
     web_keys[VK_ADD] = st[SDL_SCANCODE_KP_PLUS] ? 1 : 0;
     for (int f = 0; f < 10; f++)
         if (SDL_SCANCODE_F1 + f < n) web_keys[VK_F1 + f] = st[SDL_SCANCODE_F1 + f] ? 1 : 0;
+    /* digits (1-4: the d-pad) and the mouse buttons (left Y, right ZL while captured: nn_hid.c) */
+    for (int d = 1; d <= 9; d++)
+        if (SDL_SCANCODE_1 + d - 1 < n) web_keys['0' + d] = st[SDL_SCANCODE_1 + d - 1] ? 1 : 0;
+    if (SDL_SCANCODE_0 < n) web_keys['0'] = st[SDL_SCANCODE_0] ? 1 : 0;
+    const SDL_MouseButtonFlags mb = SDL_GetMouseState(NULL, NULL);
+    web_keys[VK_LBUTTON] = (mb & SDL_BUTTON_LMASK) ? 1 : 0;
+    web_keys[VK_RBUTTON] = (mb & SDL_BUTTON_RMASK) ? 1 : 0;
 }
 
 static void refresh_size(void) {
