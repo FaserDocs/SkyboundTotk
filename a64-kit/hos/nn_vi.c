@@ -80,10 +80,11 @@ static double frame_cap_hz(void) {
     }
     return hz;
 }
+static volatile int64_t step30_until;   /* (the 1/30 s step of the menus below, hos_frame_step_buttons) */
 static void frame_limit(void) {
     static int64_t next;
-    const int64_t period = (int64_t)(1e9 / frame_cap_hz());
-    int64_t now = hos_now_ns();
+    int64_t period = (int64_t)(1e9 / frame_cap_hz()), now = hos_now_ns();
+    if (now < step30_until && period < 1000000000 / 30) period = 1000000000 / 30;   /* (a 1/30 s step: 30 fps) */
     if (next && now < next) {
         hos_sleep_ns(next - now);
         now = hos_now_ns();
@@ -262,14 +263,15 @@ static uint64_t step_bits(float seconds) {
 }
 /* The ability wheel (hold L) captures the screen for its blurred background in the frame the world stops drawing,
    unless the game steps by whole 1/30 s frames: at any faster step (its own 60 fps mode too) the world was already
-   gone and the background came out black. While L is held (at most 3 s a press) the step is 1/30 s: the wheel pauses
-   the world anyway, and a tap of L runs a few frames at a 30 fps step. HOS_WHEEL_STEP30=0: off.
+   gone and the background came out black. While L is held (at most 3 s a press) the step is 1/30 s and frames are
+   held to 30 a second (frame_limit), so the world keeps its speed where no menu opens (L before the abilities, the
+   d-pad with nothing to show): at 60 fps and more a 1/30 s step ran it 2-4x too fast (SkyboundTotk #22).
+   HOS_WHEEL_STEP30=0: off.
    The quick menus of the d-pad (hold left: shields, right: weapons, up with R or ZR: what to throw or fuse to arrows)
    capture the same way and came out black too: held, they take the same step. With the step taken only from the
    read that saw the press, the weapon menu still came out black one time in two: a new press of these buttons now
-   reaches the game two frames later (at most 50 ms), after frames at the 1/30 s step have begun. Returns the buttons
-   the game is given. */
-static volatile int64_t step30_until;
+   reaches the game two frames later (at most 80 ms: two frames at 30 fps), after frames at the 1/30 s step have
+   begun. Returns the buttons the game is given. */
 uint64_t hos_frame_step_buttons(uint64_t buttons) {
     static int on = -1;
     static int64_t held_since, held_from;
@@ -283,7 +285,7 @@ uint64_t hos_frame_step_buttons(uint64_t buttons) {
     }
     if (!held_since) held_since = now, held_from = hos_present_count;
     if (now - held_since < 3000000000LL) step30_until = now + 100000000;
-    if (hos_present_count - held_from < 2 && now - held_since < 50000000) buttons &= ~menus;
+    if (hos_present_count - held_from < 2 && now - held_since < 80000000) buttons &= ~menus;
     return buttons;
 }
 static uint64_t frame_step(void) {
@@ -300,6 +302,10 @@ static void frame_step_present(int64_t now) {
     static double samples[5];
     static int n, next;
     if (!realtime_on()) return;
+    if (now < step30_until) {   /* (the menus' 30 fps: the step after them starts from frames of its own) */
+        last = 0;
+        return;
+    }
     const double dt = last ? (now - last) * 1e-9 : 0;
     last = now;
     if (dt <= 0.001 || dt > 0.25) {   /* (a loading hitch: start over, the step stays) */
