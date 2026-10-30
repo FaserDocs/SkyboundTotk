@@ -16,6 +16,13 @@
 #include <stdarg.h>
 
 #define HLE(sym) void imp_##sym(Ctx *c)
+/* HOS_GAME_VERSION: the game update the address hooks below are for, from the build (build.py reads the main
+   module's build id). An update moves the game's functions, so a hook compiles the address of the version it is
+   for and the other version's hooks are left out (ENTRY_HOOKs: the address is not in the lift; SPLICE_AFTERs:
+   skipped with a note). */
+#ifndef HOS_GAME_VERSION
+#define HOS_GAME_VERSION 100
+#endif
 /* ENTRY_HOOK(0x0xxxxxxx) { ... }: runs at the entry of the lifted guest function at that address (8 hex digits),
    with its arguments in c; return 1 when it handled the call (the function then returns at once, x0 is the result),
    0 to run the function as usual. build.py splices the call into the lifted code (only that file recompiles). */

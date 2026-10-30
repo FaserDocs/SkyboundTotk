@@ -19,7 +19,11 @@
 
 #pragma clang fp contract(off)
 
+#if HOS_GAME_VERSION == 121
+void f_0874e914(Ctx *);
+#else
 void f_08704b7c(Ctx *);
+#endif
 
 static int cull_off(void) {
     static int off = -1;
@@ -37,7 +41,7 @@ static long check_calls, check_native, check_diff;
 
 static int native_visible(Ctx *c, uint64_t *visible);
 
-ENTRY_HOOK(0x08704b7c) {
+static int cull_hook(Ctx *c, void (*orig)(Ctx *)) {
     if (in_check || cull_off() || (c->fpcr != 0 && c->fpcr != 0x01000000) || (c->fpsr & 0x15) != 0x15) return 0;
     uint64_t v;
     if (!cull_check()) {
@@ -47,7 +51,7 @@ ENTRY_HOOK(0x08704b7c) {
     }
     const int done = native_visible(c, &v);
     in_check = 1;
-    f_08704b7c(c);   /* (x0, x1 as the caller set them: the hook changed nothing yet) */
+    orig(c);   /* (x0, x1 as the caller set them: the hook changed nothing yet) */
     in_check = 0;
     const long n = __atomic_add_fetch(&check_calls, 1, __ATOMIC_RELAXED);
     if (done) {
@@ -59,6 +63,11 @@ ENTRY_HOOK(0x08704b7c) {
         hos_log("cull check: %ld calls, %ld answered natively, %ld different", n, check_native, check_diff);
     return 1;
 }
+#if HOS_GAME_VERSION == 121
+ENTRY_HOOK(0x0874e914) { return cull_hook(c, f_0874e914); }
+#else
+ENTRY_HOOK(0x08704b7c) { return cull_hook(c, f_08704b7c); }
+#endif
 
 static float gf(uint64_t a) {
     float f;

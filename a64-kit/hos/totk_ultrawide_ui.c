@@ -1,6 +1,6 @@
 /* The HUD for ultrawide (totk_ultrawide.c): the cameras see the wider view and the present stretches the 16:9 frame
    over the window, so the 2D layouts must be narrower by the same factor to keep their shapes. TOTK's layouts live in
-   one archive, content:/UI/LayoutArchive/Common.Product.100.Nin_NX_NVN.blarc.zs (zstd with the game's zs.zsdic
+   one archive, content:/UI/LayoutArchive/Common.Product.<version>.Nin_NX_NVN.blarc.zs (zstd with the game's zs.zsdic
    dictionary, a SARC of .bflyt layouts and .bflan animations). When ultrawide is on, the first open of that archive
    gets a copy whose layouts have their root pane's horizontal scale set to (16:9) / aspect, except the full-screen
    backgrounds and fades (they fill the view); the copy is cached as <user>/ultrawide_ui/<aspect>.blarc.zs, a zstd
@@ -17,7 +17,24 @@
 extern float hos_view_aspect;
 extern const char *hos_user_dir;
 
-static const char *const kArchive = "content:/UI/LayoutArchive/Common.Product.100.Nin_NX_NVN.blarc.zs";
+/* The archive's name carries the game's version ("Common.Product.100" in 1.0.0, ".110" in 1.2.1): the one the
+   image mounts. */
+static const char *layout_archive(void) {
+    static const char *const names[] = {
+        "content:/UI/LayoutArchive/Common.Product.110.Nin_NX_NVN.blarc.zs",
+        "content:/UI/LayoutArchive/Common.Product.100.Nin_NX_NVN.blarc.zs",
+    };
+    static const char *found;
+    static int looked;
+    if (!looked) {
+        looked = 1;
+        char probe[600];
+        for (unsigned i = 0; i < sizeof names / sizeof *names && !found; i++)
+            if (hos_fs_host_path(names[i], probe, sizeof probe) && GetFileAttributesA(probe) != INVALID_FILE_ATTRIBUTES)
+                found = names[i];
+    }
+    return found;
+}
 
 static uint8_t *read_host(const char *path, size_t *n) {
     HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -125,6 +142,8 @@ static int write_raw_zstd(const char *path, const uint8_t *b, size_t n) {
 /* nn_fs.c, OpenFile: the narrowed copy for the layout archive while ultrawide is on (0: the file itself) */
 int hos_ultrawide_redirect(const char *guest, char *out, size_t cap) {
     if (hos_view_aspect <= 0 || strncmp(guest, "content:", 8)) return 0;
+    const char *kArchive = layout_archive();
+    if (!kArchive) return 0;
     const char *rel = guest + 8;
     while (*rel == '/') rel++;
     if (strcmp(rel, kArchive + 9)) return 0;   /* (kArchive past "content:/") */
