@@ -14,7 +14,7 @@ Keep your game files, generated code, executable package and saves private. The 
 
 ### Requirements
 
-- Windows 10/11 x64 and a GPU and driver supported by wgpu-native. Allow **at least 45 GB free in addition to the original game dump** for intermediate files and the separate packaged RomFS; the build is CPU- and memory-intensive.
+- Windows 10/11 x64 and a GPU and driver supported by wgpu-native. Allow **at least 45 GB free in addition to the original game dump** for intermediate files and the separate packaged RomFS; the build is CPU- and memory-intensive. It runs as many compiles at once as fit in 80% of your RAM at 3.5 GB each (three on a 16 GB PC); set `RX_JOBS=<n>` to choose.
 - Python 3.10 or newer on PATH, with `lz4` installed: `python -m pip install lz4`.
 - Visual Studio 2022 Build Tools with the MSVC C++ tools and Windows SDK. Use an **x64 Native Tools Command Prompt** so the compiler can find the Windows headers and libraries.
 - Clang, clang++ and lld. The build previously used emsdk 6.0.9: install it separately and set `EMSDK` to its directory (the lookup defaults to `C:\emsdk`), or put these LLVM tools on PATH. The build script does not download compilers or Python packages.
@@ -53,6 +53,7 @@ The package normally creates its own `user/` directory beside the executable; it
 - **Compiler, headers or libraries missing:** open the x64 Native Tools prompt and check that the C++ tools, Windows SDK, Clang, clang++ and lld are installed and discoverable. Set `EMSDK` if the LLVM tools are in a non-default emsdk directory.
 - **Wrong module or missing RomFS:** check the extracted folder layout and version. A base-game ID match is not a complete integrity check.
 - **Existing output or stale/incomplete lift:** move the indicated package or build directory aside, preserving `user/` first, then retry. An interrupted copy can also leave a nonempty package that needs to be moved aside.
+- **"Not enough memory left" after long play:** older builds kept every render pipeline used in the last 10 minutes, which reached about 14,000 pipelines and 17 GB of memory in one report (issue #10). Past 9000 pipelines, the ones unused for a minute are now released (`RX_PIPELINE_HARD_CAP=<n>` and `RX_PIPELINE_HARD_TTL_S=<s>` change that).
 - **First launch or new scene stutters:** shader translation and pipeline compilation may happen as scenes are encountered. The native pipeline cache helps prepare previously encountered pipelines on later launches; it cannot guarantee stutter-free play.
 - **GPU device lost or wrong GPU:** AMD cards lost the WebGPU device at startup while the GPU ASTC decoder was created (issue #1; fixed). The log now includes wgpu's own warnings and errors (`RX_WGPU_LOG=info|debug|trace` for more, `off` for none). `RX_ADAPTER=<part of the GPU's name>` (for example `RX_ADAPTER=Radeon`) picks a GPU on a PC with two, and `RX_ASTC_CPU=1` decodes ASTC textures on the CPU instead of the GPU.
 - **Crash or graphics issue:** note the game version, hardware, driver, location and settings. The standalone startup test initialized the renderer and loaded the packaged RomFS, but did not verify full gameplay or graphics correctness.
@@ -116,7 +117,7 @@ Focus the game window before using the keys. The renderer briefly reports displa
 
 | Key | Action |
 | --- | --- |
-| F6 | Toggle experimental ultrawide. A window wider than 16:9 is required; see the known issue below. |
+| F6 | Toggle experimental ultrawide / 16:10. The window must not be 16:9; see below. |
 | F7 | Toggle experimental frame interpolation. |
 | F8 | Toggle FSR 1 upscaling. |
 | F9 | Cycle FSR sharpening. |
@@ -127,7 +128,7 @@ Focus the game window before using the keys. The renderer briefly reports displa
 
 **Frame interpolation:** This is the project's own experimental image-based optical-flow interpolation, not AMD FSR frame generation. F7 is off by default and inserts estimated frames between real frames, normally targeting twice the displayed frame rate when the hardware can keep up. It does not make the game simulate more frames or reduce input latency; the display runs about one game frame behind. UI and fast motion can smear or distort, and long frame gaps are not interpolated.
 
-**Ultrawide:** F6 attempts to adjust the camera and HUD and fill a wider window. It is off by default. A wider-than-16:9 window is needed, but a user reported that F6 stretches the image instead of providing a correctly proportioned wider view. Camera hooks are present, but their behavior in that report has not been resolved or independently verified. F10 stretching alone is not true ultrawide.
+**Ultrawide:** F6 attempts to adjust the camera and HUD and fill a wider window. It is off by default. A wider-than-16:9 window is needed, but a user reported that F6 stretches the image instead of providing a correctly proportioned wider view. Camera hooks are present, but their behavior in that report has not been resolved or independently verified. F10 stretching alone is not true ultrawide. F6 also works for windows narrower than 16:9, such as 16:10 (1920x1200, 2560x1600) or 4:3: the camera takes the window's shape and the HUD keeps its proportions in a 16:9 band across the middle, while full-screen menus such as the map fill the window (checked at 1920x1200: gameplay HUD, inventory and map).
 
 Keyboard and mouse controls are experimental. WASD moves, IJKL controls the camera, Space jumps, E is action, Shift or Q is run/cancel, F attacks, Z/R are L/R, C/V are ZL/ZR, Ctrl crouches, Enter is Plus, Tab is Minus and the arrow keys are the D-pad. Click the window to capture the mouse, Esc to release it, and use `-` / `=` to adjust sensitivity. XInput and SDL-supported controllers are also handled; buttons map by physical position, Nintendo controllers included (the right face button is A). On Linux, gamepads are read through SDL3 with those same physical positions. XInput is not used. Keyboard, mouse, and F6 through F11 match the table above.
 
