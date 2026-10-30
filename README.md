@@ -134,6 +134,14 @@ Keyboard and mouse controls are experimental. WASD moves, IJKL controls the came
 
 The game speaks English (US) by default. To play in another of its languages, put a `language.txt` next to the executable (`SkyboundTOTK.exe` on Windows, `SkyboundTOTK` on Linux) whose first line is one of `ja`, `en-US`, `en-GB`, `fr`, `fr-CA`, `de`, `it`, `es`, `es-419`, `nl`, `ru`, `ko`, `zh-CN` (or `zh-Hans`), `zh-TW` (or `zh-Hant`); the environment variable `HOS_LANGUAGE` does the same. Anything else falls back to English (US).
 
+### Mods
+
+Emulator-style mod folders work: put each mod in `mods\<name>\` beside the executable, with its `romfs\` (files that replace or add to the game's RomFS) and/or `exefs\` (`.pchtxt` or `<build id>.ips` patches). Copies laid out as `mods\contents0F2C0115B6000\<name>\` work too. A folder name starting with `-` or `_` turns that mod off, and when two mods replace the same file, the one whose path sorts last wins. The log lists each mod and each file it serves.
+
+- RomFS mods work as they are. The resource size table is not merged, so a mod that makes files larger needs to ship its own (most do).
+- Data patches (`.rodata`, `.data`) apply at startup. Code patches can't, because the game code is compiled ahead of time: lift with `python a64-kit/build.py lift totk --exefs <exefs> --build build --mods <mods folder>` and rebuild to compile them in.
+- Extra code modules (`subsdk*`, for example exlaunch-based mods such as UltraCam) are not loaded.
+
 ### Why WebGPU?
 
 The renderer targets the WebGPU API and WGSL so the same general renderer and shader backend can be used by native wgpu and by browser WebGPU experiments rather than maintaining wholly separate graphics implementations. On Windows, wgpu-native translates this API to an available native backend, such as Vulkan or Direct3D 12. On Linux it uses wgpu-native's Vulkan backend, with an SDL3 window on Wayland or X11. Choosing WebGPU does not mean the desktop game runs inside a browser. It also has portability and validation tradeoffs, and translation, pipeline compilation and API overhead still require optimization. `build.bat` builds the **Windows native** package. `python build_game.py` builds the **Linux native** package on Linux. Browser functionality and packaging are not promised or validated by either launcher.
