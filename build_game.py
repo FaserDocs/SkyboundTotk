@@ -59,8 +59,6 @@ def check_game():
 
 
 def check_tools():
-    if os.name != "nt":
-        fail("This launcher builds the Windows x64 version; run it on Windows.")
     if sys.version_info < (3, 10):
         fail("Python 3.10 or newer is required.")
     try:
@@ -71,18 +69,23 @@ def check_tools():
     import toolchain
     for tool in ("clang", "clang++", "lld"):
         toolchain.need(toolchain.find(tool))
-    for path in (WGPU / "include/webgpu/webgpu.h", WGPU / "lib/wgpu_native.dll", WGPU / "lib/wgpu_native.dll.lib",
-                 ROOT / "third_party/sdl2/SDL2.dll"):
+    if os.name == "nt":
+        needed = (WGPU / "include/webgpu/webgpu.h", WGPU / "lib/wgpu_native.dll", WGPU / "lib/wgpu_native.dll.lib",
+                  ROOT / "third_party/sdl2/SDL2.dll")
+    else:
+        needed = (WGPU / "include/webgpu/webgpu.h", WGPU / "lib/libwgpu_native.so")
+        if subprocess.run(["pkg-config", "--exists", "sdl3", "libavformat", "libavcodec", "libavutil", "libswscale"]).returncode:
+            fail("sdl3 and ffmpeg (libavformat, libavcodec, libavutil, libswscale) are required.")
+    for path in needed:
         if not path.is_file():
-            fail(f"Missing bundled wgpu-native file: {path}")
-    # Fail before the lengthy lift if the compiler cannot build a native Windows program.
+            fail(f"Missing bundled runtime file: {path}")
     run(sys.executable, KIT / "lift/build_emit.py")
 
 
 def run(*args):
     cmd_str = " ".join(str(x) for x in args)
     log_and_print(f"\n== {cmd_str}")
-    
+
     process = subprocess.Popen(
         [str(x) for x in args],
         stdout=subprocess.PIPE,
@@ -130,17 +133,25 @@ def package(romfs):
     # Refuse to silently replace a previous installation, including saves or mods.
     if any(DIST.iterdir()):
         fail(f"Standalone output {DIST} is not empty. Move it aside before rebuilding; keep its user folder.")
-    for src, name in ((native / "totk.exe", "SkyboundTOTK.exe"),
-                      (native / "wgpu_native.dll", "wgpu_native.dll"),
-                      (ROOT / "third_party/sdl2/SDL2.dll", "SDL2.dll"),
-                      (image / "image.bin", "image.bin"),
-                      (image / "image.json", "image.json")):
+    if os.name == "nt":
+        outputs = ((native / "totk.exe", "SkyboundTOTK.exe"),
+                   (native / "wgpu_native.dll", "wgpu_native.dll"),
+                   (ROOT / "third_party/sdl2/SDL2.dll", "SDL2.dll"),
+                   (image / "image.bin", "image.bin"),
+                   (image / "image.json", "image.json"))
+    else:
+        outputs = ((native / "totk", "SkyboundTOTK"),
+                   (native / "libwgpu_native.so", "libwgpu_native.so"),
+                   (image / "image.bin", "image.bin"),
+                   (image / "image.json", "image.json"))
+    for src, name in outputs:
         if not src.is_file():
             fail(f"Required build output is missing: {src}")
         shutil.copy2(src, DIST / name)
     log_and_print(f"Copying RomFS to {DIST / 'romfs'}; this may take several minutes.")
     shutil.copytree(romfs, DIST / "romfs", symlinks=False)
-    log_and_print(f"\nBuild complete. Open {DIST / 'SkyboundTOTK.exe'} to play.")
+    launch = DIST / ("SkyboundTOTK.exe" if os.name == "nt" else "SkyboundTOTK")
+    log_and_print(f"\nBuild complete. Open {launch} to play.")
 
 
 def main():
@@ -153,7 +164,7 @@ def main():
     image = BUILD / "totk/image/image.json"
     generated = BUILD / "totk/gen"
     complete = image.is_file() and (generated / "a64_suyu.h").is_file() and any(generated.glob("code_*.c"))
-    
+
     if complete and stamp.is_file() and stamp.read_text(encoding="ascii").strip() == identity:
         with image.open(encoding="utf-8") as f:
             modules = {m["name"]: m["build_id"] for m in json.load(f)["modules"]}
@@ -166,7 +177,7 @@ def main():
         run(sys.executable, KIT / "build.py", "lift", "totk", "--exefs", exefs,
             "--skip", "subsdk0", "--build", BUILD)
         stamp.write_text(identity + "\n", encoding="ascii")
-        
+
     run(sys.executable, KIT / "build.py", "native", "totk", "--build", BUILD, "--wgpu", WGPU)
     package(romfs)
 

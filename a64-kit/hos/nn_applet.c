@@ -32,6 +32,10 @@ static const char *desired_language(void) {
         DWORD n = GetModuleFileNameA(NULL, path, 260);
         while (n > 0 && path[n - 1] != '\\' && path[n - 1] != '/') n--;
         snprintf(path + n, sizeof path - n, "language.txt");
+#elif defined(__linux__)
+        DWORD n = GetModuleFileNameA(NULL, path, (DWORD)(sizeof path - 1));
+        while (n > 0 && path[n - 1] != '/') n--;
+        if (n && n < sizeof path) snprintf(path + n, sizeof path - n, "language.txt");
 #endif
         FILE *f = fopen(path, "r");
         if (f) {

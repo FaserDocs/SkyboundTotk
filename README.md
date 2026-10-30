@@ -1,6 +1,6 @@
 # SkyboundTOTK
 
-SkyboundTOTK is an experimental Windows x64 static recompilation project for *The Legend of Zelda: Tears of the Kingdom*, **base game version 1.0.0**. It is not affiliated with Nintendo. Expect graphical problems and incomplete compatibility; a successful build does not guarantee a complete playthrough.
+SkyboundTOTK is an experimental native static recompilation project for *The Legend of Zelda: Tears of the Kingdom*, **base game version 1.0.0**. It targets Windows x64 and Linux x86_64. It is not affiliated with Nintendo. Expect graphical problems and incomplete compatibility; a successful build does not guarantee a complete playthrough.
 
 The project's AArch64 game code is translated ahead of time into C and compiled locally into a native executable. A runtime implements the services the game expects, and the renderer translates its graphics work and shaders for WebGPU. This is a game-specific port, not a general-purpose Switch emulator. Some graphics translation still happens at runtime.
 
@@ -57,6 +57,59 @@ The package normally creates its own `user/` directory beside the executable; it
 - **GPU device lost or wrong GPU:** AMD cards lost the WebGPU device at startup while the GPU ASTC decoder was created (issue #1; fixed). The log now includes wgpu's own warnings and errors (`RX_WGPU_LOG=info|debug|trace` for more, `off` for none). `RX_ADAPTER=<part of the GPU's name>` (for example `RX_ADAPTER=Radeon`) picks a GPU on a PC with two, and `RX_ASTC_CPU=1` decodes ASTC textures on the CPU instead of the GPU.
 - **Crash or graphics issue:** note the game version, hardware, driver, location and settings. The standalone startup test initialized the renderer and loaded the packaged RomFS, but did not verify full gameplay or graphics correctness.
 
+## Build on Linux
+
+Same game files and same `build_game.py` launcher as Windows. Run `python build_game.py` from the project directory. There is no `build.bat` step. The executable is an ELF. It links SDL3 and FFmpeg from the system and Vulkan through a patched `libwgpu_native.so` that you build. That shared library is not in the repository. The Windows package still uses the bundled `wgpu_native.dll` and `SDL2.dll`.
+
+### Requirements
+
+- x86_64 Linux and a Vulkan GPU and driver. Allow **at least 45 GB free in addition to the original game dump**. The build is CPU- and memory-intensive.
+- Python 3.10 or newer on PATH, with `lz4` installed: `python -m pip install lz4`, or the distro package.
+- Clang, clang++, lld, and pkg-config. The build script does not download compilers or Python packages.
+- SDL3 and FFmpeg development files. The build checks these pkg-config modules: `sdl3`, `libavformat`, `libavcodec`, `libavutil`, `libswscale`.
+- Rust 1.93 or newer, and libclang for bindgen, used only to build `libwgpu_native.so`.
+
+Arch Linux packages that satisfy the system dependencies:
+
+```text
+sudo pacman -S clang lld pkgconf python python-lz4 sdl3 ffmpeg
+```
+
+On Debian and Ubuntu the pkg-config modules are the requirement. A typical set is `clang`, `lld`, `pkg-config`, `python3`, `python3-lz4`, `libsdl3-dev`, `libavformat-dev`, `libavcodec-dev`, `libavutil-dev`, and `libswscale-dev`. The SDL3 package name depends on the release.
+
+### Patched wgpu-native
+
+Copy the built library to `third_party/wgpu-native/lib/libwgpu_native.so` before `build_game.py`. The headers already in `third_party/wgpu-native/include/` are the matching version. The Windows DLL in that folder is the unmodified v29.0.1.1 release. The Linux library has to include both patches under `third_party/wgpu-native/totk-patches/`.
+
+The native patch expects a sibling checkout named `wgpu-patched`. From an empty directory, with `SKYBOUND` set to this repository:
+
+```bash
+git clone --recurse-submodules --branch v29.0.1.1 https://github.com/gfx-rs/wgpu-native.git
+git clone --branch v29.0.3 https://github.com/gfx-rs/wgpu.git wgpu-patched
+git -C wgpu-native apply "$SKYBOUND/third_party/wgpu-native/totk-patches/wgpu-native-29.0.1.1.patch"
+patch -d wgpu-patched -p1 < "$SKYBOUND/third_party/wgpu-native/totk-patches/wgpu-29.0.3.patch"
+cargo build --release --manifest-path wgpu-native/Cargo.toml
+cp wgpu-native/target/release/libwgpu_native.so "$SKYBOUND/third_party/wgpu-native/lib/"
+```
+
+If bindgen cannot find libclang, set `LIBCLANG_PATH` to the directory that contains `libclang.so` (often `/usr/lib`) and rerun the cargo build. A smaller library is `cargo build --release --no-default-features --features wgsl,spirv,vulkan` run from `wgpu-native`. The playtest below used a default `--release` build. The `totk-mimalloc` cargo feature is optional.
+
+### Prepare and build
+
+1. Put the extracted 1.0.0 ExeFS and RomFS in `game/`, in the same layout as the Windows instructions.
+2. From the project directory, run `python build_game.py`.
+3. Run `dist/SkyboundTOTK/SkyboundTOTK`. Keep `image.bin`, `image.json`, `romfs/`, and `libwgpu_native.so` beside the executable. It finds that library through an `$ORIGIN` rpath. SDL3 and FFmpeg stay system libraries. The standalone folder can be moved as a unit and does not need the original `game/` folder or Wine.
+
+Lift reuse, the nonempty `dist/SkyboundTOTK/` refusal, and `user/` saves work the same way as on Windows. Native pipeline cache data is `rxcache/pipelines.bin` beside the executable.
+
+### Linux troubleshooting
+
+- **SDL3 or FFmpeg missing:** install the dev packages, then check `pkg-config --exists sdl3 libavformat libavcodec libavutil libswscale`.
+- **Missing `libwgpu_native.so`:** build it as above and copy it into `third_party/wgpu-native/lib/` before running `build_game.py`. The packaged copy has to stay next to the executable.
+- **`mmap guest window` failed:** the log includes `errno`. The runtime reserves a 4 GB window at a fixed address. A restrictive `vm.overcommit_memory` setting can reject that reservation.
+- **First launch or new scene stutters:** same shader and pipeline compilation as on Windows. The pipeline cache helps on later launches.
+- **Existing output or stale lift:** same rule as Windows. Move `dist/SkyboundTOTK/` or `build/` aside, and keep `user/` if you want the saves.
+
 ## Controls and display features
 
 Focus the game window before using the keys. The renderer briefly reports display settings in the window title; changes are saved in `user/present.txt` for the next launch.
@@ -76,13 +129,13 @@ Focus the game window before using the keys. The renderer briefly reports displa
 
 **Ultrawide:** F6 attempts to adjust the camera and HUD and fill a wider window. It is off by default. A wider-than-16:9 window is needed, but a user reported that F6 stretches the image instead of providing a correctly proportioned wider view. Camera hooks are present, but their behavior in that report has not been resolved or independently verified. F10 stretching alone is not true ultrawide.
 
-Keyboard and mouse controls are experimental. WASD moves, IJKL controls the camera, Space jumps, E is action, Shift or Q is run/cancel, F attacks, Z/R are L/R, C/V are ZL/ZR, Ctrl crouches, Enter is Plus, Tab is Minus and the arrow keys are the D-pad. Click the window to capture the mouse, Esc to release it, and use `-` / `=` to adjust sensitivity. XInput and SDL-supported controllers are also handled; buttons map by physical position, Nintendo controllers included (the right face button is A).
+Keyboard and mouse controls are experimental. WASD moves, IJKL controls the camera, Space jumps, E is action, Shift or Q is run/cancel, F attacks, Z/R are L/R, C/V are ZL/ZR, Ctrl crouches, Enter is Plus, Tab is Minus and the arrow keys are the D-pad. Click the window to capture the mouse, Esc to release it, and use `-` / `=` to adjust sensitivity. XInput and SDL-supported controllers are also handled; buttons map by physical position, Nintendo controllers included (the right face button is A). On Linux, gamepads are read through SDL3 with those same physical positions. XInput is not used. Keyboard, mouse, and F6 through F11 match the table above.
 
-The game speaks English (US) by default. To play in another of its languages, put a `language.txt` next to `SkyboundTOTK.exe` whose first line is one of `ja`, `en-US`, `en-GB`, `fr`, `fr-CA`, `de`, `it`, `es`, `es-419`, `nl`, `ru`, `ko`, `zh-CN` (or `zh-Hans`), `zh-TW` (or `zh-Hant`); the environment variable `HOS_LANGUAGE` does the same. Anything else falls back to English (US).
+The game speaks English (US) by default. To play in another of its languages, put a `language.txt` next to the executable (`SkyboundTOTK.exe` on Windows, `SkyboundTOTK` on Linux) whose first line is one of `ja`, `en-US`, `en-GB`, `fr`, `fr-CA`, `de`, `it`, `es`, `es-419`, `nl`, `ru`, `ko`, `zh-CN` (or `zh-Hans`), `zh-TW` (or `zh-Hant`); the environment variable `HOS_LANGUAGE` does the same. Anything else falls back to English (US).
 
 ### Why WebGPU?
 
-The renderer targets the WebGPU API and WGSL so the same general renderer and shader backend can be used by native wgpu and by browser WebGPU experiments rather than maintaining wholly separate graphics implementations. On Windows, wgpu-native translates this API to an available native backend, such as Vulkan or Direct3D 12; choosing WebGPU does not mean the desktop game runs inside a browser. It also has portability and validation tradeoffs, and translation, pipeline compilation and API overhead still require optimization. The root `build.bat` described here builds the **Windows native** package; browser functionality and packaging are not promised or validated by that launcher.
+The renderer targets the WebGPU API and WGSL so the same general renderer and shader backend can be used by native wgpu and by browser WebGPU experiments rather than maintaining wholly separate graphics implementations. On Windows, wgpu-native translates this API to an available native backend, such as Vulkan or Direct3D 12. On Linux it uses wgpu-native's Vulkan backend, with an SDL3 window on Wayland or X11. Choosing WebGPU does not mean the desktop game runs inside a browser. It also has portability and validation tradeoffs, and translation, pipeline compilation and API overhead still require optimization. `build.bat` builds the **Windows native** package. `python build_game.py` builds the **Linux native** package on Linux. Browser functionality and packaging are not promised or validated by either launcher.
 
 ## Known issues and limitations
 
@@ -102,6 +155,7 @@ These are reports and investigation notes, not a complete compatibility list. So
 | Browser new-game loading | **Previously reported; retest** | Earlier web experiments had an intermittent loading-screen hang. This is not a verified Windows-launcher issue; the root build does not package a browser release. |
 | Browser interpolation judder | **Earlier fix; retest** | Earlier web experiments had interpolation judder; notes record a pacing fix. Browser behavior is not validated by the Windows launcher. |
 | Performance and compatibility | **Ongoing limitation** | Frame pacing, shader warm-up and rendering vary by scene and hardware. A build and startup test are not a full-game compatibility test. |
+| Linux | **Early play** | One x86_64 Linux build (Vulkan, SDL3, FFmpeg, NVIDIA RTX 4090) got through the opening and onto the surface after the dive. The first enemy could be fought, and tree branches could be picked up. Gamepad and audio worked. This is not a full playthrough. |
 
 ## To-do
 

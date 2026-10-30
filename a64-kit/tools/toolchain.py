@@ -34,11 +34,25 @@ def lld_link():
     return path
 
 
+def is_linux():
+    target = os.environ.get("SKYBOUND_TARGET")
+    if target == "windows":
+        return False
+    if target == "linux":
+        return True
+    return os.name != "nt"
+
+
 def native_target():
+    if is_linux():
+        return ["--target=x86_64-unknown-linux-gnu", "-pthread", "-fms-extensions", "-D_GNU_SOURCE",
+                "-DRX_PLATFORM_LINUX"]
     return ["--target=x86_64-pc-windows-msvc", "-fms-extensions", "-D_CRT_SECURE_NO_WARNINGS"] if os.name == "nt" else []
 
 
 def native_link():
     # (-fuse-ld=lld, found through -B: clang ignores --ld-path for the MSVC target and ran Microsoft's link.exe, which
     # cannot read the renderer's ThinLTO bitcode)
+    if is_linux():
+        return ["-fuse-ld=lld"]
     return ["-fuse-ld=lld", "-B" + os.path.dirname(lld_link())] if os.name == "nt" else []

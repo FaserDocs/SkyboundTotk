@@ -19,6 +19,9 @@
 #include <windows.h>
 
 #include "rx_internal.h"
+#ifdef __linux__
+#include "rx_window.h"
+#endif
 #include "video_core/textures/decoders.h"
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -379,6 +382,26 @@ bool init_device(HWND hwnd) {
         return false;
     }
     if (hwnd) {
+#ifdef __linux__
+        auto* lw = static_cast<RxLinuxWindow*>(hwnd);
+        if (lw->kind == 1) {
+            WGPUSurfaceSourceWaylandSurface src{};
+            src.chain.sType = WGPUSType_SurfaceSourceWaylandSurface;
+            src.display = lw->display;
+            src.surface = lw->wl_surface;
+            WGPUSurfaceDescriptor sd{};
+            sd.nextInChain = &src.chain;
+            surface = wgpuInstanceCreateSurface(dev.instance, &sd);
+        } else {
+            WGPUSurfaceSourceXlibWindow src{};
+            src.chain.sType = WGPUSType_SurfaceSourceXlibWindow;
+            src.display = lw->display;
+            src.window = lw->xwindow;
+            WGPUSurfaceDescriptor sd{};
+            sd.nextInChain = &src.chain;
+            surface = wgpuInstanceCreateSurface(dev.instance, &sd);
+        }
+#else
         WGPUSurfaceSourceWindowsHWND src{};
         src.chain.sType = WGPUSType_SurfaceSourceWindowsHWND;
         src.hinstance = GetModuleHandleA(nullptr);
@@ -386,6 +409,7 @@ bool init_device(HWND hwnd) {
         WGPUSurfaceDescriptor sd{};
         sd.nextInChain = &src.chain;
         surface = wgpuInstanceCreateSurface(dev.instance, &sd);
+#endif
     }
 #endif
 
@@ -543,6 +567,10 @@ bool init_device(HWND hwnd) {
 #ifdef __EMSCRIPTEN__
     present_mode = WGPUPresentMode_Fifo;
     configure_surface(1280, 720);
+#elif defined(__linux__)
+    auto* lw = static_cast<RxLinuxWindow*>(hwnd);
+    configure_surface((uint32_t)std::max(lw->width, 1), (uint32_t)std::max(lw->height, 1));
+    present_window_size(lw->width, lw->height);
 #else
     RECT rc;
     GetClientRect(hwnd, &rc);

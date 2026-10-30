@@ -398,6 +398,8 @@ static_assert(sizeof(TSCEntry) == 0x20, "TSCEntry has wrong size");
 
 } // namespace Tegra::Texture
 
+#include <functional>
+
 template <>
 struct std::hash<Tegra::Texture::TICEntry> {
     size_t operator()(const Tegra::Texture::TICEntry& tic) const noexcept;
