@@ -338,6 +338,95 @@ SPLICE_AFTER(0x087a83e4, "int64_t _o=8; { uint64_t _p0=0,_p1=0;") { frame_step_i
 SPLICE_AFTER(0x088f689c, "recomp_store32(c,(c->x[8]+0ULL),_v); } }") { frame_step_store(c); }
 #endif
 
+#if HOS_GAME_VERSION != 121
+static float sreg(Ctx *c, int r) {
+    float f;
+    uint32_t u = (uint32_t)c->vreg[r][0];
+    memcpy(&f, &u, 4);
+    return f;
+}
+static void set_sreg(Ctx *c, int r, float f) {   /* (a scalar write: the rest of the register is zeroed) */
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    c->vreg[r][0] = u;
+    c->vreg[r][1] = 0;
+}
+static float gfloat(uint64_t a) {
+    float f;
+    uint32_t u = G32(a);
+    memcpy(&f, &u, 4);
+    return f;
+}
+static void set_gfloat(uint64_t a, float f) {
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    G32(a) = u;
+}
+
+/* Hair and cloth (MacNativeGames' patch_cloth_clock for v1.0.0, MIT; totk-pc-recomp's patch set "cloth"): the actor
+   animation update builds a second clock {seconds = factor / 30, ratio = factor} every rendered frame, so above 30 fps
+   hair and cloth swung too fast (2x at 60 fps, 4x at 120). The ordinary animation clock already follows the real-time
+   step. The update is inlined at three places and called once more (f_0882c224 from main+0x7b6358; its other caller
+   already passes measured time); each now takes the real-time step: seconds = step seconds * factor, ratio = step
+   ratio (seconds * 30) * factor. Needs the real-time step; HOS_CLOTH_REALTIME=0: off. */
+static int cloth_on(void) {
+    static int on = -1;
+    if (on < 0) on = realtime_on() && !(getenv("HOS_CLOTH_REALTIME") && *getenv("HOS_CLOTH_REALTIME") == '0');
+    return on;
+}
+/* HOS_HIGHFPS_LOG=1: the first calls of each patch below, with the values it computed */
+static void highfps_log(int site, const char *what, float a, float b) {
+    static int on = -1, n[4];
+    if (on < 0) on = getenv("HOS_HIGHFPS_LOG") != NULL;
+    if (on && site < 4 && n[site]++ < 3) hos_log("vi: %s %g -> %g", what, a, b);
+}
+static float step_seconds(void) {
+    float s;
+    const uint32_t u = (uint32_t)(frame_step() >> 32);
+    memcpy(&s, &u, 4);
+    return s;
+}
+/* main+0x7b598c and main+0x7b6b2c: stp s0, s8, [x29, #-0x40] stores {seconds = s0 = factor / 30, ratio = s8 = factor} */
+SPLICE_AFTER_EACH(0x087b5408, "int64_t _o=-64; { uint64_t _p0=0,_p1=0; memcpy(&_p0,&c->vreg[0][0],4); memcpy(&_p1,&c->vreg[8][0],4); recomp_stp32(") {
+    if (!cloth_on()) return;
+    const float factor = sreg(c, 8), seconds = step_seconds() * factor;
+    set_sreg(c, 0, seconds);
+    set_gfloat(c->x[29] - 0x40, seconds);
+    set_gfloat(c->x[29] - 0x3c, seconds * 30.0f);
+    highfps_log(0, "cloth clock (inline): factor, seconds", factor, seconds);
+}
+/* main+0x7f5ec4 fmul s1, s0, s1 (seconds = factor / 30), main+0x7f5ed0 str s0, [sp, #0x114] (ratio = factor) */
+SPLICE_AFTER(0x087f5a84, "recomp_store32_sp(c,(c->x[31]+276ULL),_v);") {
+    if (!cloth_on()) return;
+    const float factor = sreg(c, 0), seconds = step_seconds() * factor;
+    set_sreg(c, 1, seconds);
+    set_gfloat(c->x[31] + 0x114, seconds * 30.0f);
+    highfps_log(1, "cloth clock (inline 3): factor, seconds", factor, seconds);
+}
+/* the call at main+0x7b6358: s2 = factor / 30 (seconds), s3 = factor (ratio), each times the step ratio */
+ENTRY_HOOK(0x0882c224) {
+    if (c->x[30] != 0x087b635c || !cloth_on()) return 0;
+    const float ratio = step_seconds() * 30.0f;
+    set_sreg(c, 2, sreg(c, 2) * ratio);
+    set_sreg(c, 3, sreg(c, 3) * ratio);
+    highfps_log(2, "cloth clock (call): ratio, seconds", ratio, sreg(c, 2));
+    return 0;
+}
+
+/* Trampolines above 100 fps (MacNativeGames' patch_slowmo_bounce, their #61, MIT): main+0xce3fec compares the time
+   object's +0x28 (30 / (ratio * time scale)) with 100 and, when greater, scales the velocity Link takes over from the
+   ground body by 0.1. At the shipping 30 Hz that means "time slowed below 0.3", but above 100 fps it fires with time
+   running normally and the sky-island trampolines stop bouncing. The value compared is now +0x28 * +0x38 (the 30 Hz
+   ratio) = 30 / time scale: the same at 30 Hz, independent of the frame rate. HOS_HIGHFPS_FIX=0: off. */
+SPLICE_AFTER(0x08ce3d54, "recomp_load32(c,(c->x[8]+40ULL)); a64_vset64(c->vreg[0],_v);") {
+    static int on = -1;
+    if (on < 0) on = !(getenv("HOS_HIGHFPS_FIX") && *getenv("HOS_HIGHFPS_FIX") == '0');
+    if (!on) return;
+    highfps_log(3, "ground body check: 30 / (ratio * time scale), compared value", sreg(c, 0), sreg(c, 0) * gfloat(c->x[8] + 0x38));
+    set_sreg(c, 0, sreg(c, 0) * gfloat(c->x[8] + 0x38));
+}
+#endif
+
 static void totk_set_interval(int n) {
     if (!totk_ctl) return;
     G32(totk_ctl + 0) = (uint32_t)n;      /* min */
