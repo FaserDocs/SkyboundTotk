@@ -61,9 +61,16 @@ std::string Bordered(EmitContext& ctx, const IR::TextureInstInfo& info, std::str
 /// UNORM depth texture: against a float one a point just past a shadow cascade's far plane compared 1.0x <= 1.0 and
 /// fell into shadow. TOTK's moonlight cascades end within view: dark bands across the ground at night, moving with the
 /// camera (gone with the clamp, 2026-10-28). RX_NO_DREF_CLAMP=1: the reference as computed (debugging).
-std::string Dref(std::string_view dref) {
+/// Against an array texture (TOTK's shadow cascades: D16 arrays) the reference is also rounded to 16 bits, as Maxwell
+/// compares at the texture's precision: a driver that compares the full float (AMD's) left a lit face failing its own
+/// compare by a fraction of a step, shadowed (totk-pc-recomp 6029719 / MacNativeGames 6283599, MIT).
+/// RX_NO_D16_DREF=1: not rounded.
+std::string Dref(std::string_view dref, bool array = false) {
     static const bool no_clamp{std::getenv("RX_NO_DREF_CLAMP") != nullptr};
-    return no_clamp ? std::string{dref} : fmt::format("clamp({},0.0,1.0)", dref);
+    static const bool no_d16{std::getenv("RX_NO_D16_DREF") != nullptr};
+    if (no_clamp) return std::string{dref};
+    if (array && !no_d16) return fmt::format("(floor(clamp({},0.0,1.0)*65535.0+0.5)/65535.0)", dref);
+    return fmt::format("clamp({},0.0,1.0)", dref);
 }
 
 /// The same for a depth comparison: outside, the reference is compared with the border depth.
@@ -252,7 +259,7 @@ void EmitImageSampleDrefImplicitLod(EmitContext& ctx, IR::Inst& inst, const IR::
     (void)bias_lc;
     PrepareSparse(ctx, inst);
     const auto fn{ctx.stage == Stage::Fragment ? "textureSampleCompare" : "textureSampleCompareLevel"};
-    const auto d{Dref(dref)};
+    const auto d{Dref(dref, IsArray(info))};
     ctx.AddF32("{}={};", inst, BorderedCompare(ctx, info, coords, d, fmt::format("{}({},{},{}{})", fn,
                TexSamp(ctx, info), SampleCoords(info, coords), d, SampleOffsetArg(info, offset))));
 }
@@ -267,7 +274,7 @@ void EmitImageSampleDrefExplicitLod(EmitContext& ctx, IR::Inst& inst, const IR::
     (void)index;
     (void)lod_lc;   // WGSL compares at level 0 only
     PrepareSparse(ctx, inst);
-    const auto d{Dref(dref)};
+    const auto d{Dref(dref, IsArray(info))};
     ctx.AddF32("{}={};", inst, BorderedCompare(ctx, info, coords, d, fmt::format("textureSampleCompareLevel({},{},{}{})",
                TexSamp(ctx, info), SampleCoords(info, coords), d, SampleOffsetArg(info, offset))));
 }
@@ -304,7 +311,7 @@ void EmitImageGatherDref(EmitContext& ctx, IR::Inst& inst, const IR::Value& inde
     (void)offset2;
     PrepareSparse(ctx, inst);
     ctx.AddF32x4("{}=textureGatherCompare({},{},{}{});", inst, TexSamp(ctx, info), SampleCoords(info, coords),
-                 Dref(dref), SampleOffsetArg(info, offset));
+                 Dref(dref, IsArray(info)), SampleOffsetArg(info, offset));
 }
 
 void EmitImageFetch(EmitContext& ctx, IR::Inst& inst, const IR::Value& index,
