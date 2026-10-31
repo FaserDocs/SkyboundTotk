@@ -103,10 +103,15 @@ static void mouse_look_tick(void) {
     if (fabs(look_x) < 1e-6 && fabs(look_y) < 1e-6) look_x = look_y = 0;
 }
 
-static int mouse_stick(int32_t *rx, int32_t *ry) {
+/* While the ability wheel is open (L held, Q on the keyboard), the mouse points instead of panning (MacNativeGames
+   2d0f0f0, MIT): the wheel picks the ability the right stick points at, and with panning the stick settled back to
+   the centre as soon as the mouse stopped, taking the pick with it. The stick starts at the centre, stays where the
+   mouse puts it (cut to length 1) and is centred again when L is let go, so the camera does not turn by itself after
+   the wheel closes. */
+static int mouse_stick(int32_t *rx, int32_t *ry, int pointing) {
     static int64_t next_tick;
     static int32_t shown[2];
-    static int captured;
+    static int captured, was_pointing;
     static int invert = -1;
     if (invert < 0) {
         invert = getenv("HOS_MOUSE_INVERT_Y") != NULL;
@@ -127,8 +132,15 @@ static int mouse_stick(int32_t *rx, int32_t *ry) {
     if (now >= next_tick) {
         int32_t dx, dy;
         captured = hos_mouse_take(&dx, &dy);
+        if (pointing != was_pointing) look_x = look_y = 0, was_pointing = pointing;
         if (!captured) look_x = look_y = 0;
-        else if (dx || dy) mouse_look_move(dx, invert ? dy : -dy);
+        else if (pointing) {
+            const double k = hos_mouse_sens * 0.03;
+            look_x += dx * k;
+            look_y += (invert ? dy : -dy) * k;
+            const double length = sqrt(look_x * look_x + look_y * look_y);
+            if (length > 1) look_x /= length, look_y /= length;
+        } else if (dx || dy) mouse_look_move(dx, invert ? dy : -dy);
         /* (the ticks since the last read: the first shows the deflection, the rest only decay it; at most 10, a
            read after a pause starts afresh) */
         const int64_t ticks = next_tick ? (now - next_tick) / MOUSE_TICK_NS + 1 : 1;
@@ -137,7 +149,8 @@ static int mouse_stick(int32_t *rx, int32_t *ry) {
         if (shown_length > 1) ox /= shown_length, oy /= shown_length;
         shown[0] = (int32_t)lround(ox * 32767);
         shown[1] = (int32_t)lround(oy * 32767);
-        for (int64_t i = 0; i < (ticks < 10 ? ticks : 10); i++) mouse_look_tick();
+        if (!pointing)
+            for (int64_t i = 0; i < (ticks < 10 ? ticks : 10); i++) mouse_look_tick();
         next_tick = (next_tick && ticks <= 10 ? next_tick + ticks * MOUSE_TICK_NS : now + MOUSE_TICK_NS);
     }
     if (!captured) return 0;
@@ -389,7 +402,7 @@ static void read_input(uint64_t *buttons, int32_t stick[4]) {
     /* left button Y (attack), right button ZL (shield, lock on), while the mouse is captured; a button held when
        the capture began counts only after it was let go (the click that captures never reaches the game) */
     static int armed[2];
-    if (mouse_stick(&mouse[2], &mouse[3])) {
+    if (mouse_stick(&mouse[2], &mouse[3], (int)(*buttons >> B_L & 1))) {
         stick_max(stick, mouse);
         const int vk[2] = {VK_LBUTTON, VK_RBUTTON}, b[2] = {B_Y, B_ZL};
         for (int i = 0; i < 2; i++) {
