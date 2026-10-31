@@ -3972,9 +3972,11 @@ void nvn_draw(NvnState& s, const NvnDraw& d) {
     // 2026-10-24); one to a pass they match the console. Why is open: not barriers between dispatch and draw (flushing
     // or waiting after each dispatch changed nothing), not rx's per-pass state (setting everything for every draw changed
     // nothing), not the first instance, the page merge or the dispatch's data. ~100 such draws a frame in the rainy
-    // castle cost no measurable fps. RX_GPU_PARTICLE_PASS=0: off; =2: any vertex stream a dispatch wrote (skinned meshes
-    // too, ~11% slower there)
-    static const int particle_pass_set = getenv("RX_GPU_PARTICLE_PASS") ? atoi(getenv("RX_GPU_PARTICLE_PASS")) : 1;
+    // castle cost no measurable fps. The cause was the driver assuming no infinities in our shaders (fixed 2026-10-31:
+    // shaders declare SignedZeroInfNanPreserve, CLAUDE.md "Inf/NaN in shaders"): with it the vanish draws no lines with
+    // the rule off (3 pot runs), without it lines again, so the rule is off by default. RX_GPU_PARTICLE_PASS=1: on;
+    // =2: any vertex stream a dispatch wrote (skinned meshes too)
+    static const int particle_pass_set = getenv("RX_GPU_PARTICLE_PASS") ? atoi(getenv("RX_GPU_PARTICLE_PASS")) : 0;
     static const bool particle_ab = ab_named("RX_GPU_PARTICLE_PASS");   // (HOS_AB: what the rule costs)
     if (const int particle_pass = particle_ab && ab_flipped() ? !particle_pass_set : particle_pass_set; particle_pass) {
         bool gpu_fed = false;
