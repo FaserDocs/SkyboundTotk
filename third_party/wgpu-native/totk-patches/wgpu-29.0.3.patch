@@ -727,8 +727,54 @@ diff -ruN a/wgpu-core/src/track/texture.rs b/wgpu-core/src/track/texture.rs
      /// Must be called with the highest possible Texture ID before
 diff -ruN a/wgpu-hal/src/vulkan/adapter.rs b/wgpu-hal/src/vulkan/adapter.rs
 --- a/wgpu-hal/src/vulkan/adapter.rs	2026-05-01 22:18:31.000000000 -0400
-+++ b/wgpu-hal/src/vulkan/adapter.rs	2026-10-25 01:46:04.827490700 -0400
-@@ -2745,6 +2745,7 @@
++++ b/wgpu-hal/src/vulkan/adapter.rs	2026-10-31 04:45:19.379907400 -0400
+@@ -1130,6 +1130,9 @@
+     /// `VK_EXT_pci_bus_info` extension.
+     pci_bus_info: Option<vk::PhysicalDevicePCIBusInfoPropertiesEXT<'static>>,
+ 
++    /// (TOTK port) `VK_KHR_shader_float_controls` properties, promoted to Vulkan 1.2.
++    float_controls: Option<vk::PhysicalDeviceFloatControlsProperties<'static>>,
++
+     /// The device API version.
+     ///
+     /// Which is the version of Vulkan supported for device-level functionality.
+@@ -1771,6 +1774,14 @@
+                 let supports_mesh_shader = capabilities.supports_extension(ext::mesh_shader::NAME);
+ 
+                 let mut properties2 = vk::PhysicalDeviceProperties2KHR::default();
++                if capabilities.device_api_version >= vk::API_VERSION_1_2
++                    || capabilities.supports_extension(khr::shader_float_controls::NAME)
++                {
++                    let next = capabilities
++                        .float_controls
++                        .insert(vk::PhysicalDeviceFloatControlsProperties::default());
++                    properties2 = properties2.push_next(next);
++                }
+                 if supports_maintenance3 {
+                     let next = capabilities
+                         .maintenance_3
+@@ -2605,6 +2616,20 @@
+                 spv::WriterFlags::LABEL_VARYINGS,
+                 self.phd_capabilities.properties.vendor_id != crate::auxil::db::qualcomm::VENDOR,
+             );
++            // (TOTK port) Every shader declares SignedZeroInfNanPreserve for 32-bit floats when the device supports it
++            // (float controls, core from Vulkan 1.2 / SPIR-V 1.4), as suyu's SPIR-V backend does: without it the driver
++            // may assume float math never sees an infinity or a NaN, and the translated console shaders compute with
++            // both (TOTK's Fuse-mode lightning ribbons got vertices at 1e24 on NVIDIA: green streaks across the
++            // screen). WGPU_PRESERVE_INF_NAN=0: off.
++            if self.phd_capabilities.device_api_version >= vk::API_VERSION_1_2
++                && self.phd_capabilities.float_controls.as_ref().map_or(false, |f| {
++                    f.shader_signed_zero_inf_nan_preserve_float32 == vk::TRUE
++                })
++                && std::env::var("WGPU_PRESERVE_INF_NAN").map_or(true, |v| v != "0")
++            {
++                flags.insert(spv::WriterFlags::PRESERVE_INF_NAN);
++                capabilities.push(spv::Capability::SignedZeroInfNanPreserve);
++            }
+             flags.set(
+                 spv::WriterFlags::FORCE_POINT_SIZE,
+                 //Note: we could technically disable this when we are compiling separate entry points,
+@@ -2745,6 +2770,7 @@
              features,
              workarounds: self.workarounds,
              render_passes: Mutex::new(Default::default()),
