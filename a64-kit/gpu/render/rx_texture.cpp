@@ -2039,7 +2039,7 @@ TexInfo nvn_tex_info(const nvn_tex& t, const nvn_view* v) {
         i.layers = std::max(1u, d.depth);
         break;
     case NVN_TEXTURE_TARGET_CUBEMAP: i.layers = 6; break;
-    case NVN_TEXTURE_TARGET_CUBEMAP_ARRAY: i.layers = std::max(1u, d.depth) * 6; break;
+    case NVN_TEXTURE_TARGET_CUBEMAP_ARRAY: i.layers = std::max(6u, d.depth); break;   // (depth counts layer-faces)
     case NVN_TEXTURE_TARGET_3D:
         i.dimension = WGPUTextureDimension_3D;
         i.size.depth = std::max(1u, d.depth);

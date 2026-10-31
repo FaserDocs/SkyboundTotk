@@ -4,8 +4,10 @@
    From the NVN layer of d2r-mobile / MacNativeGames (jhaizhou, MIT), itself based on deko3d source/dk_image.cpp
    (zlib license, Copyright (C) 2018-2020 fincs; altered: the NVN SDK's integer rounding for the automatic block height,
    packaged layouts, MINIMAL_LAYOUT). One GOB = 64 bytes x 8 rows = 512 bytes; the block height (tileH, in GOBs) is
-   picked from height x 1.5; levels are added up in whole blocks. A packaged texture's 8 layout bytes: byte 0 = log2 of
-   the block height (checked against 16 of the game's textures, 4 of which differ from the automatic choice). */
+   picked from height x 1.5; levels are added up in whole blocks. A packaged texture's 8 layout bytes: byte 0's low
+   nibble = log2 of the block height, its high nibble = log2 of the block depth (3D). CUBEMAP_ARRAY depth already counts
+   layer-faces (a multiple of 6), and linear textures are sized in pixel rows, block-compressed ones too (MacNativeGames
+   3c482a7, found against the original driver under emulation: nxnative PR 11). */
 #include "../gpu/render/rx_nvn.h"
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -54,7 +56,7 @@ static void shape(const nvn_texdesc *d, unsigned *dpl, int *layered, uint32_t *w
         case 2: *dpl = 3; break;                                        // 3D
         case 4: case 6: *dpl = 2; *layered = 1; break;                  // 2D_ARRAY / MS_ARRAY
         case 8: *dpl = 2; *z = 6; *layered = 1; break;                  // CUBEMAP
-        case 9: *dpl = 2; *z = d->depth * 6; *layered = 1; break;       // CUBEMAP_ARRAY
+        case 9: *dpl = 2; *layered = 1; break;                          // CUBEMAP_ARRAY: depth already counts layer-faces
         default: *dpl = 2; *z = 1; break;                               // 2D / MS / RECTANGLE
     }
     if (*z == 0) *z = 1;
@@ -119,14 +121,18 @@ void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
     if (nvn_tex_is_linear(d)) {                                            // Pitch storage: explicit stride, otherwise 32-byte (LINEAR) / 128-byte (LINEAR_RENDER_TARGET) alignment
         o->align = (d->flags & 0x40) ? 128 : 32;
         uint32_t stride = nvn_tex_linear_stride(d);
-        o->layer_size = o->size = (uint64_t)stride * blk(h, t.bh);
+        o->layer_size = o->size = (uint64_t)stride * h;              // (the driver counts pixel rows, block-compressed formats too)
         return;
     }
     unsigned tileH = 0, tileD = 0;
     /* NVN truncates height*1.5 to whole GOB rows before choosing the power of
        two. Rounding up here changes e.g. 40 BC rows from H2 to H3 even when
        the total allocation size is unchanged, so padding becomes black texels. */
-    if (dpl == 2) { uint32_t ah = blk(h * sy, t.bh); tileH = d->pkg_block_h ? (unsigned)d->pkg_block_h - 1 : pick_tile((ah + ah / 2) / 8); }
+    if (d->pkg_block_h) {                                             // packaged byte 0: low nibble block height, high nibble block depth
+        const unsigned pl = (unsigned)(d->pkg_block_h - 1) & 0xFF;
+        if (dpl >= 2) tileH = pl & 0xF;
+        if (dpl == 3) tileD = pl >> 4;
+    } else if (dpl == 2) { uint32_t ah = blk(h * sy, t.bh); tileH = pick_tile((ah + ah / 2) / 8); }
     else if (dpl == 3) tileD = pick_tile(z + z / 2);
     uint64_t ls = layer_bytes(d, dpl, layered, w, h, z, tileH, tileD, t);
     if ((d->flags & 0x200) && !d->pkg_block_h && minimal_layout_on()) {
